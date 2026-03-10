@@ -112,7 +112,9 @@ func isAdmin() bool {
 	if err != nil {
 		return false
 	}
-	defer windows.FreeSid(sid)
+	defer func() {
+		_ = windows.FreeSid(sid)
+	}()
 
 	token := windows.Token(0)
 	member, err := token.IsMember(sid)

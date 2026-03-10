@@ -101,7 +101,9 @@ func InstallService(name, display, cfgPath, user, pass string) error {
 	if err != nil {
 		return err
 	}
-	defer m.Disconnect()
+	defer func() {
+		_ = m.Disconnect()
+	}()
 
 	s, err := m.OpenService(name)
 	if err == nil {
@@ -126,7 +128,9 @@ func InstallService(name, display, cfgPath, user, pass string) error {
 	if err != nil {
 		return err
 	}
-	defer s.Close()
+	defer func() {
+		_ = s.Close()
+	}()
 
 	err = eventlog.InstallAsEventCreate(name, eventlog.Error|eventlog.Warning|eventlog.Info)
 	if err != nil {
@@ -142,12 +146,16 @@ func RemoveService(name string) error {
 	if err != nil {
 		return err
 	}
-	defer m.Disconnect()
+	defer func() {
+		_ = m.Disconnect()
+	}()
 	s, err := m.OpenService(name)
 	if err != nil {
 		return fmt.Errorf("service %s is not installed", name)
 	}
-	defer s.Close()
+	defer func() {
+		_ = s.Close()
+	}()
 
 	// Attempt to stop the service if it's running
 	status, err := s.Control(svc.Stop)
