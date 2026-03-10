@@ -1,0 +1,49 @@
+Design in Go (windows server 2019+) an efficient directory poller.
+
+1- CLI that can be installed as well as a Windows service
+
+2- Poll a directory with multiple algorithms:
+* recursive is forbidden. If a sub folder is detected, process aborts with an error. CLI aborts, but the Windows service logs the error in Application EventLog and wait for the next polling cycle
+* interval: every interval in seconds (ex: 300)
+* batch: every number of files accumulated (ex: 1000). If the number of files never reaches the threshold, implement a fallback timeout (configurable) to process the remaining files
+* event: event based, ie realtime, everytime a file is written and fully committed (ex: true/false)
+
+For all algorithms, check for Windows file locks as well, as in this case, delete or move post action would fail.
+
+
+3- Make sure file integrity is enforced with multiple method (configurable n attempts every n seconds):
+* xxhash based - hash is not changing within attempts period
+* timestamp based - file time stamp is not changing
+* size based - size is not changing
+
+4- depending on the polling algorithm, and file integrity algorithm, a configurable action (internal or external) will be executed.
+* Internal: multithreaded SFTP. High performance upload to a SFTP server with username + password, or username + SSH key, or
+  username + SSH Key + password. Number of parallel connections is configurable.
+* external: script with parameters executed
+* post processing actions after successful internal or external action on the processed files ONLY (actions are exclusive)
+    - delete in place
+	- move to an archive folder as a batch of files (under a dedicated datestamp folder YYYYMMDD-HHMMSS)
+    - move to an archive folder as a timestamped archive (one consolidated archive for the entire batch, zstd MT compression)
+
+5- All parameters and configuration will be specified as a JSON file, specified as an argument
+Properties:
+poll
+  - algorithm: interval or batch or event (exclusive) - derault: interval
+  - value
+  - if batch, time value to wait for accumulation if not reachable (default: 10mn)
+integrity
+  - algorithm: hash, modified timestamp, size (default: timestamp)
+  - verification attempts: number (default: 3)
+  - verification interval: seconds (default: 5)
+action
+  - type: sftp, script (exclusive)
+  - if sftp
+       - number of concurrent connections (default to number of cores x 2)
+       - servername, port, username, password and/or ssh key, sub folder
+	   - incremental / resume method: delete (false/true), move (false/true) - exclusive
+	   - if move:
+	        - archive path
+			- or compression archive name and path
+  - if script
+      - name and path
+	  - max execution time
