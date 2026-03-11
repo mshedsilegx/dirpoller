@@ -6,6 +6,10 @@
 *.dylib
 /bin/
 
+# Linting
+golangci-lint*
+gosec*
+
 # OS generated files
 .DS_Store
 .DS_Store?
