@@ -19,7 +19,12 @@ func NewIntervalPoller(cfg *config.Config) *IntervalPoller {
 }
 
 func (p *IntervalPoller) Start(ctx context.Context, results chan<- []string) error {
-	ticker := time.NewTicker(time.Duration(p.cfg.Poll.Value) * time.Second)
+	interval, ok := p.cfg.Poll.Value.(int)
+	if !ok {
+		// Default to 60 seconds if not an int
+		interval = 60
+	}
+	ticker := time.NewTicker(time.Duration(interval) * time.Second)
 	defer ticker.Stop()
 
 	// Initial check
@@ -40,6 +45,9 @@ func (p *IntervalPoller) Start(ctx context.Context, results chan<- []string) err
 }
 
 func (p *IntervalPoller) poll(results chan<- []string) error {
+	if _, err := p.utils.HasSubfolders(p.cfg.Poll.Directory); err != nil {
+		return err
+	}
 	files, err := p.utils.GetFiles(p.cfg.Poll.Directory)
 	if err != nil {
 		return err

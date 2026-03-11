@@ -2,9 +2,11 @@
 package archive
 
 import (
+	"archive/tar"
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"time"
@@ -25,7 +27,7 @@ func NewArchiver(cfg *config.Config) *Archiver {
 
 // Process executes the configured post-action (Delete, Move, or Compress) on a batch of files.
 func (a *Archiver) Process(ctx context.Context, files []string) error {
-	switch a.cfg.Action.SFTP.PostAction {
+	switch a.cfg.Action.PostProcess.Action {
 	case config.PostActionDelete:
 		return a.deleteFiles(ctx, files)
 	case config.PostActionMoveArchive:
@@ -53,7 +55,7 @@ func (a *Archiver) deleteFiles(ctx context.Context, files []string) error {
 
 func (a *Archiver) moveToFolder(ctx context.Context, files []string) error {
 	datestamp := time.Now().Format("20060102-150405.000000")
-	destDir := filepath.Join(a.cfg.Action.SFTP.ArchivePath, datestamp)
+	destDir := filepath.Join(a.cfg.Action.PostProcess.ArchivePath, datestamp)
 
 	if err := os.MkdirAll(destDir, 0750); err != nil {
 		return fmt.Errorf("failed to create archive directory: %w", err)
@@ -76,9 +78,9 @@ func (a *Archiver) moveToFolder(ctx context.Context, files []string) error {
 func (a *Archiver) compressToArchive(ctx context.Context, files []string) error {
 	datestamp := time.Now().Format("20060102-150405.000000")
 	archiveName := fmt.Sprintf("batch-%s.zst", datestamp)
-	archivePath := filepath.Clean(filepath.Join(a.cfg.Action.SFTP.ArchivePath, archiveName))
+	archivePath := filepath.Clean(filepath.Join(a.cfg.Action.PostProcess.ArchivePath, archiveName))
 
-	if err := os.MkdirAll(a.cfg.Action.SFTP.ArchivePath, 0750); err != nil {
+	if err := os.MkdirAll(a.cfg.Action.PostProcess.ArchivePath, 0750); err != nil {
 		return fmt.Errorf("failed to create archive directory: %w", err)
 	}
 
@@ -88,7 +90,7 @@ func (a *Archiver) compressToArchive(ctx context.Context, files []string) error 
 	}
 	defer func() {
 		if closeErr := f.Close(); closeErr != nil {
-			fmt.Printf("Warning: failed to close archive file %s: %v\n", archivePath, closeErr)
+			log.Printf("Warning: failed to close archive file %s: %v\n", archivePath, closeErr)
 		}
 	}()
 
@@ -99,7 +101,15 @@ func (a *Archiver) compressToArchive(ctx context.Context, files []string) error 
 	}
 	defer func() {
 		if closeErr := enc.Close(); closeErr != nil {
-			fmt.Printf("Warning: failed to close zstd encoder: %v\n", closeErr)
+			log.Printf("Warning: failed to close zstd encoder: %v\n", closeErr)
+		}
+	}()
+
+	// Use tar to consolidate files into one archive
+	tw := tar.NewWriter(enc)
+	defer func() {
+		if closeErr := tw.Close(); closeErr != nil {
+			log.Printf("Warning: failed to close tar writer: %v\n", closeErr)
 		}
 	}()
 
@@ -108,27 +118,50 @@ func (a *Archiver) compressToArchive(ctx context.Context, files []string) error 
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
-			if err := a.addFileToArchive(enc, file); err != nil {
+			if err := a.addFileToArchive(tw, file); err != nil {
 				return err
 			}
 		}
+	}
+
+	// Ensure everything is flushed before deleting originals
+	if err := tw.Close(); err != nil {
+		return fmt.Errorf("failed to close tar writer during flush: %w", err)
+	}
+	if err := enc.Close(); err != nil {
+		return fmt.Errorf("failed to close zstd writer during flush: %w", err)
 	}
 
 	// After successful compression, delete original files
 	return a.deleteFiles(ctx, files)
 }
 
-func (a *Archiver) addFileToArchive(w io.Writer, path string) error {
+func (a *Archiver) addFileToArchive(tw *tar.Writer, path string) error {
 	f, err := os.Open(filepath.Clean(path)) // #nosec G304
 	if err != nil {
 		return err
 	}
 	defer func() {
 		if closeErr := f.Close(); closeErr != nil {
-			fmt.Printf("Warning: failed to close file %s: %v\n", path, closeErr)
+			log.Printf("Warning: failed to close file %s: %v\n", path, closeErr)
 		}
 	}()
 
-	_, err = io.Copy(w, f)
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+
+	header, err := tar.FileInfoHeader(info, "")
+	if err != nil {
+		return err
+	}
+	header.Name = filepath.Base(path)
+
+	if err := tw.WriteHeader(header); err != nil {
+		return err
+	}
+
+	_, err = io.Copy(tw, f)
 	return err
 }

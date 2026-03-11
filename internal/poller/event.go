@@ -3,7 +3,9 @@ package poller
 import (
 	"context"
 	"fmt"
+	"log"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"criticalsys.net/dirpoller/internal/config"
@@ -13,6 +15,7 @@ import (
 type EventPoller struct {
 	cfg   *config.Config
 	utils OSUtils
+	mu    sync.Mutex
 }
 
 func NewEventPoller(cfg *config.Config) *EventPoller {
@@ -29,13 +32,16 @@ func (p *EventPoller) Start(ctx context.Context, results chan<- []string) error 
 	}
 	defer func() {
 		if closeErr := watcher.Close(); closeErr != nil {
-			fmt.Printf("Warning: failed to close watcher: %v\n", closeErr)
+			log.Printf("Warning: failed to close watcher: %v\n", closeErr)
 		}
 	}()
 
 	// Track last processed events to deduplicate rapid fire notifications
 	processed := make(map[string]time.Time)
 	const debounceInterval = 500 * time.Millisecond
+	const cleanupInterval = 5 * time.Minute
+	cleanupTicker := time.NewTicker(cleanupInterval)
+	defer cleanupTicker.Stop()
 
 	// Perform initial check for existing subfolders
 	if _, err := p.utils.HasSubfolders(p.cfg.Poll.Directory); err != nil {
@@ -57,6 +63,15 @@ func (p *EventPoller) Start(ctx context.Context, results chan<- []string) error 
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-cleanupTicker.C:
+			p.mu.Lock()
+			for k, v := range processed {
+				if time.Since(v) > debounceInterval*2 {
+					delete(processed, k)
+				}
+			}
+			p.mu.Unlock()
+
 		case event, ok := <-watcher.Events:
 			if !ok {
 				return nil
@@ -75,20 +90,13 @@ func (p *EventPoller) Start(ctx context.Context, results chan<- []string) error 
 
 			// When a file is written or created, we send it for integrity check
 			if event.Op&(fsnotify.Write|fsnotify.Create) != 0 {
+				p.mu.Lock()
 				last, ok := processed[event.Name]
 				if !ok || time.Since(last) > debounceInterval {
 					processed[event.Name] = time.Now()
 					results <- []string{event.Name}
-
-					// Cleanup old entries from the map periodically
-					if len(processed) > 1000 {
-						for k, v := range processed {
-							if time.Since(v) > debounceInterval*2 {
-								delete(processed, k)
-							}
-						}
-					}
 				}
+				p.mu.Unlock()
 			}
 
 		case err, ok := <-watcher.Errors:

@@ -2,6 +2,7 @@ package poller
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 
@@ -43,7 +44,7 @@ func (w *windowsOSUtils) IsLocked(path string) (bool, error) {
 	}
 	defer func() {
 		if closeErr := windows.CloseHandle(handle); closeErr != nil {
-			fmt.Printf("Warning: failed to close file handle for %s: %v\n", path, closeErr)
+			log.Printf("Warning: failed to close file handle for %s: %v\n", path, closeErr)
 		}
 	}()
 

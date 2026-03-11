@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"time"
@@ -87,6 +88,11 @@ func (v *Verifier) getIntegrityValue(path string) (string, error) {
 	}
 }
 
+// CalculateHash calculates the xxHash-64 of a file.
+func (v *Verifier) CalculateHash(path string) (string, error) {
+	return v.calculateHash(path)
+}
+
 func (v *Verifier) calculateHash(path string) (string, error) {
 	f, err := os.Open(filepath.Clean(path)) // #nosec G304
 	if err != nil {
@@ -94,7 +100,7 @@ func (v *Verifier) calculateHash(path string) (string, error) {
 	}
 	defer func() {
 		if closeErr := f.Close(); closeErr != nil {
-			fmt.Printf("Warning: failed to close file %s: %v\n", path, closeErr)
+			log.Printf("Warning: failed to close file %s: %v\n", path, closeErr)
 		}
 	}()
 

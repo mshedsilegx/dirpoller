@@ -17,14 +17,17 @@ To ensure maximum native performance on Windows while maintaining a path for sea
 - **Interface Injection**: Core components like the `Engine`, `Poller`, and `Verifier` are entirely platform-agnostic, receiving OS-specific implementations via interfaces at runtime.
 
 ### 2.1 Polling Engine (`internal/poller`)
-The engine supports three mutually exclusive algorithms:
+The engine supports four mutually exclusive algorithms:
 - **Interval**: Scans the directory every `n` seconds.
-- **Batch**: Accumulates files until a count threshold is reached. Includes a fallback timeout (default 10m) to process remaining files if the threshold isn't met.
-- **Event**: Real-time monitoring using Windows-native `ReadDirectoryChangesW`. Includes a debounce mechanism (500ms) to handle rapid file system notifications.
+- **Batch**: Accumulates files until a count threshold is reached.
+- **Event**: Real-time monitoring using Windows-native `ReadDirectoryChangesW`. Includes a debounce mechanism (500ms).
+- **Trigger**: Waits for a specific file pattern (exact or wildcard) to appear before processing all pending files.
+
+**Fallback Timeout**: For **Batch** and **Trigger** modes, a configurable timeout (default 10m) forces processing of any pending files even if the threshold or trigger file hasn't appeared.
 
 **Recursive Constraint**: Recursive scanning is strictly forbidden. If a subfolder is detected:
-- **CLI**: Aborts with an error.
-- **Service**: Logs an error to the Windows EventLog and skips the current cycle.
+- **CLI**: Aborts immediately with an error.
+- **Service**: Logs the error to the Windows Application EventLog and continues to wait for the next polling cycle.
 
 ### 2.2 Integrity Verification (`internal/integrity`)
 Before any action, files must pass an integrity check (configurable `n` attempts every `n` seconds):
@@ -37,11 +40,12 @@ Before any action, files must pass an integrity check (configurable `n` attempts
 - **Internal (SFTP)**: 
   - Multi-threaded upload using a semaphore-controlled worker pool.
   - Supports Password, SSH Key, or Multi-factor (Key + Password) authentication.
+  - Supports incremental/resume methods (delete vs move) as post-actions.
   - Performance: Parallel connections default to `Cores x 2`.
 - **External (Script)**: 
   - Executes a configured script with the file path as an argument.
-  - **Performance**: Now parallelized using a semaphore-controlled worker pool (matching SFTP concurrency).
-  - Enforces a maximum execution timeout and uses absolute path validation for security.
+  - **Performance**: Parallelized using a semaphore-controlled worker pool.
+  - Enforces a maximum execution timeout and absolute path validation.
 
 ### 2.4 Post-Processing (`internal/archive`)
 After successful action execution, files undergo one of the following exclusive post-actions:
@@ -59,7 +63,18 @@ All parameters are specified in a JSON file. The system implements:
 - **Service Lifecycle**: Implements `winsvc` for Start/Stop/Pause/Continue.
 - **Logging**: Uses the native Windows EventLog (`DirPoller` source) for error reporting and status updates.
 
-## 5. Security Design
+## 5. Logging Facility (`internal/service/custom_logger.go`)
+The application implements a dual-track logging system (configurable via CLI or JSON):
+
+- **System Logs (Daily)**: Tracks process-level events (start, stop, OS issues).
+  - Format: `base_process_YYYYMMDD.log`
+- **Activity Logs (Per Execution)**: Detailed report of data movement.
+  - Format: `base_activity_YYYYMMDD-HHMMSS.log`
+  - Structure: Includes a #Status summary (total, OK, error) and categorized lists of files with size and xxHash.
+
+**Log Retention**: If `log_retention` > 0, the engine automatically purges both process and activity logs older than the specified number of days during each execution cycle, with a single daily execution at midnight.
+
+## 6. Security Design
 - **Input Sanitization**: All file paths are converted to absolute paths and validated before processing.
 - **Resource Management**: Throttled concurrency for both SFTP and Script actions. Streaming I/O and context-aware cancellation are used throughout to prevent memory/socket exhaustion and ensure clean shutdowns.
 - **Authentication**: Secure handling of SSH keys and passwords via the `golang.org/x/crypto/ssh` module.

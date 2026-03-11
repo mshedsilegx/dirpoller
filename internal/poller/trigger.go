@@ -3,6 +3,8 @@ package poller
 import (
 	"context"
 	"fmt"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -10,22 +12,27 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
-type BatchPoller struct {
+type TriggerPoller struct {
 	cfg   *config.Config
 	utils OSUtils
 	mu    sync.Mutex
 	files map[string]struct{}
 }
 
-func NewBatchPoller(cfg *config.Config) *BatchPoller {
-	return &BatchPoller{
+func NewTriggerPoller(cfg *config.Config) *TriggerPoller {
+	return &TriggerPoller{
 		cfg:   cfg,
 		utils: NewOSUtils(),
 		files: make(map[string]struct{}),
 	}
 }
 
-func (p *BatchPoller) Start(ctx context.Context, results chan<- []string) error {
+func (p *TriggerPoller) Start(ctx context.Context, results chan<- []string) error {
+	pattern, ok := p.cfg.Poll.Value.(string)
+	if !ok {
+		return fmt.Errorf("trigger pattern must be a string")
+	}
+
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return fmt.Errorf("failed to create watcher: %w", err)
@@ -46,13 +53,17 @@ func (p *BatchPoller) Start(ctx context.Context, results chan<- []string) error 
 	if err == nil {
 		p.mu.Lock()
 		for _, f := range initialFiles {
+			if p.isTriggerFile(f, pattern) {
+				p.flush(results)
+				break
+			}
 			p.files[f] = struct{}{}
 		}
-		p.checkThreshold(results)
 		p.mu.Unlock()
 	}
 
-	timeoutTicker := time.NewTicker(time.Duration(p.cfg.Poll.BatchTimeoutSeconds) * time.Second)
+	timeoutDuration := time.Duration(p.cfg.Poll.BatchTimeoutSeconds) * time.Second
+	timeoutTicker := time.NewTicker(timeoutDuration)
 	defer timeoutTicker.Stop()
 
 	for {
@@ -71,15 +82,15 @@ func (p *BatchPoller) Start(ctx context.Context, results chan<- []string) error 
 			}
 			if event.Op&(fsnotify.Write|fsnotify.Create) != 0 {
 				p.mu.Lock()
-				// Check if it's a directory before adding to files
-				stat, err := p.utils.Stat(event.Name)
-				if err == nil && stat.IsDir() {
-					p.mu.Unlock()
-					return fmt.Errorf("subfolder detected: %s", event.Name)
-				}
-				p.files[event.Name] = struct{}{}
-				if p.checkThreshold(results) {
-					timeoutTicker.Reset(time.Duration(p.cfg.Poll.BatchTimeoutSeconds) * time.Second)
+				if p.isTriggerFile(event.Name, pattern) {
+					p.flush(results)
+					timeoutTicker.Reset(timeoutDuration)
+				} else {
+					// Check if it's a directory before adding to files
+					stat, err := p.utils.Stat(event.Name)
+					if err == nil && !stat.IsDir() {
+						p.files[event.Name] = struct{}{}
+					}
 				}
 				p.mu.Unlock()
 			}
@@ -92,20 +103,20 @@ func (p *BatchPoller) Start(ctx context.Context, results chan<- []string) error 
 	}
 }
 
-func (p *BatchPoller) checkThreshold(results chan<- []string) bool {
-	threshold, ok := p.cfg.Poll.Value.(int)
-	if !ok {
-		// Default to 1 if not an int
-		threshold = 1
+func (p *TriggerPoller) isTriggerFile(path, pattern string) bool {
+	name := filepath.Base(path)
+	match, err := filepath.Match(pattern, name)
+	if err != nil {
+		// If pattern is invalid, fallback to exact match or contains
+		return name == pattern || strings.Contains(name, pattern)
 	}
-	if len(p.files) >= threshold {
-		p.flush(results)
-		return true
-	}
-	return false
+	return match
 }
 
-func (p *BatchPoller) flush(results chan<- []string) {
+func (p *TriggerPoller) flush(results chan<- []string) {
+	if len(p.files) == 0 {
+		return
+	}
 	batch := make([]string, 0, len(p.files))
 	for f := range p.files {
 		batch = append(batch, f)

@@ -22,21 +22,18 @@ func main() {
 	configPath := flag.String("config", "", "Path to JSON configuration file")
 	install := flag.Bool("install", false, "Install as Windows service")
 	remove := flag.Bool("remove", false, "Remove Windows service")
+	serviceName := flag.String("name", "", "Custom Windows service name (optional, defaults to config or 'DirPoller')")
 	user := flag.String("user", "", "Windows service user account (optional, default: LocalSystem)")
 	pass := flag.String("pass", "", "Windows service user password (optional)")
 	debug := flag.Bool("debug", false, "Run in debug mode")
 	versionFlag := flag.Bool("version", false, "Print version information")
+	logName := flag.String("log", "", "Enable custom logging with specific log name")
+	logRetention := flag.Int("log-retention", 0, "Log retention in days (0 = disabled)")
 	flag.Parse()
 
 	if *versionFlag {
 		fmt.Printf("DirPoller version: %s\n", version)
 		return
-	}
-
-	if *install || *remove {
-		if !isAdmin() {
-			log.Fatal("Administrative privileges are required to install or remove the service. Please run as Administrator.")
-		}
 	}
 
 	if *configPath == "" {
@@ -48,6 +45,35 @@ func main() {
 		log.Fatalf("Failed to get absolute path for config: %v", err)
 	}
 
+	// Run as CLI
+	cfg, err := config.LoadConfig(absConfigPath)
+	if err != nil {
+		log.Fatalf("Failed to load config: %v", err)
+	}
+
+	// Override config with CLI flags
+	if *logName != "" {
+		cfg.Logging = []config.LoggingConfig{
+			{
+				LogName:      *logName,
+				LogRetention: *logRetention,
+			},
+		}
+	} else if *logRetention > 0 && len(cfg.Logging) > 0 {
+		cfg.Logging[0].LogRetention = *logRetention
+	}
+
+	if *install || *remove {
+		if !isAdmin() {
+			log.Fatal("Administrative privileges are required to install or remove the service. Please run as Administrator.")
+		}
+	}
+
+	// Override config service name if flag is provided
+	if *serviceName != "" {
+		cfg.ServiceName = *serviceName
+	}
+
 	// Check if running as a service
 	isService, err := svc.IsWindowsService()
 	if err != nil {
@@ -55,32 +81,30 @@ func main() {
 	}
 
 	if isService {
-		service.RunService("DirPoller", absConfigPath, *debug)
+		service.RunService(cfg.ServiceName, absConfigPath, *debug)
 		return
 	}
 
 	if *install {
-		err = service.InstallService("DirPoller", "Directory Poller", absConfigPath, *user, *pass)
+		displayName := fmt.Sprintf("Directory Poller (%s)", cfg.ServiceName)
+		if cfg.ServiceName == "DirPoller" {
+			displayName = "Directory Poller"
+		}
+		err = service.InstallService(cfg.ServiceName, displayName, absConfigPath, *user, *pass)
 		if err != nil {
 			log.Fatalf("Failed to install service: %v", err)
 		}
-		fmt.Println("Service installed successfully.")
+		fmt.Printf("Service '%s' installed successfully.\n", cfg.ServiceName)
 		return
 	}
 
 	if *remove {
-		err = service.RemoveService("DirPoller")
+		err = service.RemoveService(cfg.ServiceName)
 		if err != nil {
 			log.Fatalf("Failed to remove service: %v", err)
 		}
-		fmt.Println("Service removed successfully.")
+		fmt.Printf("Service '%s' removed successfully.\n", cfg.ServiceName)
 		return
-	}
-
-	// Run as CLI
-	cfg, err := config.LoadConfig(absConfigPath)
-	if err != nil {
-		log.Fatalf("Failed to load config: %v", err)
 	}
 
 	engine, err := service.NewEngine(cfg, false)

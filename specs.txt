@@ -5,11 +5,12 @@ Design in Go (windows server 2019+) an efficient directory poller.
 2- Poll a directory with multiple algorithms:
 * recursive is forbidden. If a sub folder is detected, process aborts with an error. CLI aborts, but the Windows service logs the error in Application EventLog and wait for the next polling cycle
 * interval: every interval in seconds (ex: 300)
-* batch: every number of files accumulated (ex: 1000). If the number of files never reaches the threshold, implement a fallback timeout (configurable) to process the remaining files
+* batch: every number of files accumulated (ex: 1000). If the number of files never reaches the threshold
 * event: event based, ie realtime, everytime a file is written and fully committed (ex: true/false)
+* trigger: value would be file pattern (exact name, ex: name.ext or wildcard, ex: name_*.ext), behavior is to wait until the trigger file shows up in polled folder to start processing
 
+Implement a fallback timeout (configurable) to process the remaining files, for batch and trigger, to force processing any pending files if the trigger file never shows in the determined period
 For all algorithms, check for Windows file locks as well, as in this case, delete or move post action would fail.
-
 
 3- Make sure file integrity is enforced with multiple method (configurable n attempts every n seconds):
 * xxhash based - hash is not changing within attempts period
@@ -22,7 +23,7 @@ For all algorithms, check for Windows file locks as well, as in this case, delet
 * external: script with parameters executed
 * post processing actions after successful internal or external action on the processed files ONLY (actions are exclusive)
     - delete in place
-	- move to an archive folder as a batch of files (under a dedicated datestamp folder YYYYMMDD-HHMMSS)
+  	- move to an archive folder as a batch of files (under a dedicated datestamp folder YYYYMMDD-HHMMSS)
     - move to an archive folder as a timestamped archive (one consolidated archive for the entire batch, zstd MT compression)
 
 5- All parameters and configuration will be specified as a JSON file, specified as an argument
@@ -47,3 +48,35 @@ action
   - if script
       - name and path
 	  - max execution time
+
+6- Implement an optional logging facility with CLI flag: -log <name> -log-retention <days>
+and JSON config directive
+logging:
+  - log_name: <fully qualified log name>
+  - log_retention: in days, applied to all logs, process and activity. Executes once a day at 0:00:00
+
+If log_retention = 0, it is disabled (default), if > 0, purge all logs older than number of days specified
+Separate process and activity logs. By definition:
+- process logs: logs related to the process/system itself (start, stop, OS/resources issues, errors, etc.).
+- activity logs: logs related to the data activity itself affecting files (files processed, errors, etc.).
+
+Logs will be generated with a unique datestamp per execution. Example, if log name is: /var/logs/dirpoller.log
+- system log name (daily): /var/logs/dirpoller_process_YYYYMMDD.log
+- activity log name (by execution): /var/logs/dirpoller_activity_YYYYMMDD-HHMMSS.log
+
+The activity log structure will be:
+# Status
+date stamp|total number of files picked up
+date stamp|number of files processed OK
+date stamp|number of files in error
+------
+# List of files processed successfully
+date stamp|<list of files, one per line>|size|xxhash
+------
+# List of files in error
+date stamp|<list of files> in error|size|xxhash|error cause for each file
+
+The system log structure will be:
+date stamp|message
+
+For Windows, only the process log events will be logged to the Windows Event Log.

@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"time"
 
@@ -91,19 +92,94 @@ func RunService(name string, cfgPath string, isDebug bool) {
 	}
 }
 
+type ServiceManager interface {
+	Connect() (Manager, error)
+}
+
+type Manager interface {
+	io.Closer
+	OpenService(name string) (Service, error)
+	CreateService(name, exepath string, config mgr.Config, args ...string) (Service, error)
+}
+
+type Service interface {
+	io.Closer
+	Control(c svc.Cmd) (svc.Status, error)
+	Query() (svc.Status, error)
+	Delete() error
+}
+
+type winServiceManager struct{}
+
+func (w *winServiceManager) Connect() (Manager, error) {
+	m, err := mgr.Connect()
+	if err != nil {
+		return nil, err
+	}
+	return &winManager{m: m}, nil
+}
+
+type winManager struct {
+	m *mgr.Mgr
+}
+
+func (w *winManager) Close() error {
+	return w.m.Disconnect()
+}
+
+func (w *winManager) OpenService(name string) (Service, error) {
+	s, err := w.m.OpenService(name)
+	if err != nil {
+		return nil, err
+	}
+	return &winService{s: s}, nil
+}
+
+func (w *winManager) CreateService(name, exepath string, config mgr.Config, args ...string) (Service, error) {
+	s, err := w.m.CreateService(name, exepath, config, args...)
+	if err != nil {
+		return nil, err
+	}
+	return &winService{s: s}, nil
+}
+
+type winService struct {
+	s *mgr.Service
+}
+
+func (w *winService) Close() error {
+	return w.s.Close()
+}
+
+func (w *winService) Control(c svc.Cmd) (svc.Status, error) {
+	return w.s.Control(c)
+}
+
+func (w *winService) Query() (svc.Status, error) {
+	return w.s.Query()
+}
+
+func (w *winService) Delete() error {
+	return w.s.Delete()
+}
+
+var (
+	defaultManager  ServiceManager = &winServiceManager{}
+	eventLogInstall                = eventlog.InstallAsEventCreate
+	eventLogRemove                 = eventlog.Remove
+)
+
 // InstallService installs the application as a Windows service.
 func InstallService(name, display, cfgPath, user, pass string) error {
 	exepath, err := os.Executable()
 	if err != nil {
 		return err
 	}
-	m, err := mgr.Connect()
+	m, err := defaultManager.Connect()
 	if err != nil {
 		return err
 	}
-	defer func() {
-		_ = m.Disconnect()
-	}()
+	defer func() { _ = m.Close() }()
 
 	s, err := m.OpenService(name)
 	if err == nil {
@@ -128,11 +204,9 @@ func InstallService(name, display, cfgPath, user, pass string) error {
 	if err != nil {
 		return err
 	}
-	defer func() {
-		_ = s.Close()
-	}()
+	defer func() { _ = s.Close() }()
 
-	err = eventlog.InstallAsEventCreate(name, eventlog.Error|eventlog.Warning|eventlog.Info)
+	err = eventLogInstall(name, eventlog.Error|eventlog.Warning|eventlog.Info)
 	if err != nil {
 		_ = s.Delete()
 		return fmt.Errorf("InstallAsEventCreate() failed: %w", err)
@@ -142,20 +216,16 @@ func InstallService(name, display, cfgPath, user, pass string) error {
 
 // RemoveService removes the application from Windows services.
 func RemoveService(name string) error {
-	m, err := mgr.Connect()
+	m, err := defaultManager.Connect()
 	if err != nil {
 		return err
 	}
-	defer func() {
-		_ = m.Disconnect()
-	}()
+	defer func() { _ = m.Close() }()
 	s, err := m.OpenService(name)
 	if err != nil {
 		return fmt.Errorf("service %s is not installed", name)
 	}
-	defer func() {
-		_ = s.Close()
-	}()
+	defer func() { _ = s.Close() }()
 
 	// Attempt to stop the service if it's running
 	status, err := s.Control(svc.Stop)
@@ -175,7 +245,7 @@ func RemoveService(name string) error {
 	if err != nil {
 		return err
 	}
-	err = eventlog.Remove(name)
+	err = eventLogRemove(name)
 	if err != nil {
 		return fmt.Errorf("RemoveEventLogSource() failed: %w", err)
 	}

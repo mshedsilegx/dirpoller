@@ -29,6 +29,9 @@ The application can run as a standalone CLI or be installed as a native Windows 
 | Argument | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `-config` | String | (Required) | Full absolute path to the JSON configuration file. |
+| `-log` | String | `""` | Enable custom logging with a specific base log name. |
+| `-log-retention`| Integer | `0` | Number of days to keep logs (0 = disabled). |
+| `-name` | String | `""` | Custom Windows service name (optional, defaults to config or 'DirPoller'). |
 | `-install` | Boolean | `false` | Install the application as a native Windows service. |
 | `-remove` | Boolean | `false` | Stop and remove the Windows service and EventLog source. |
 | `-user` | String | `""` | Service account (e.g., `DOMAIN\User`). Defaults to `LocalSystem`. |
@@ -62,13 +65,15 @@ The `-remove` command gracefully stops the service (if running), deletes it from
 ```
 
 ### Service Control and Monitoring
-Once installed, the service is named `DirPoller` and can be managed using standard Windows commands or the GUI.
+Once installed, the service is named `DirPoller` (or your custom name) and can be managed using standard Windows commands or the GUI.
 
 #### Standard Commands
 - **Start**: `Start-Service DirPoller` or `net start DirPoller`
 - **Stop**: `Stop-Service DirPoller` or `net stop DirPoller`
 - **Restart**: `Restart-Service DirPoller`
 - **Status**: `Get-Service DirPoller` or `sc.exe query DirPoller`
+
+*Note: Replace `DirPoller` with your custom name if provided during installation.*
 
 #### Verifying Logs
 DirPoller logs all critical events (startup, errors, processing summaries) to the **Windows Event Log**.
@@ -87,20 +92,26 @@ DirPoller is entirely driven by a structured JSON configuration. For reliability
 
 The configuration is divided into four functional blocks:
 
-### 1. Polling Strategy (`poll`)
+### 1. Global Settings
+| Property | Type | Default | Logic / Purpose |
+| :--- | :--- | :--- | :--- |
+| `service_name` | String | `DirPoller` | Custom name for the Windows service instance. |
+
+### 2. Polling Strategy (`poll`)
 Determines how the application discovers files in the target directory.
 
 | Property | Type | Default | Logic / Purpose |
 | :--- | :--- | :--- | :--- |
 | `directory` | String | **Required** | The absolute local path to watch. Must exist and be accessible. |
-| `algorithm` | String | `interval` | The detection method: `interval`, `batch`, or `event`. |
-| `value` | Integer | `0` | **Context-sensitive**: In `interval` mode, this is seconds between scans. In `batch` mode, this is the number of files required to trigger processing. |
-| `batch_timeout_seconds` | Integer | `600` | Only used in `batch` mode. Forces processing of any pending files if this many seconds pass, even if the `value` count isn't met. |
+| `algorithm` | String | `interval` | The detection method: `interval`, `batch`, `event`, or `trigger`. |
+| `value` | Mix | `0` | **Context-sensitive**: In `interval` mode, this is seconds. In `batch` mode, this is file count. In `trigger` mode, this is a file pattern (string). |
+| `batch_timeout_seconds` | Integer | `600` | Used in `batch` and `trigger` modes. Forces processing if the threshold or trigger is not met within this period. |
 
 **Algorithm Details:**
 *   **`interval`**: Performs a full directory scan at fixed time steps. Reliable for all storage types.
 *   **`batch`**: Collects files as they arrive but waits until a specific volume is reached before executing actions.
 *   **`event`**: Uses Windows `ReadDirectoryChangesW` for real-time, low-overhead detection. Best for high-traffic local disks.
+*   **`trigger`**: Waits for a specific "trigger file" (exact name or wildcard) to appear before processing all pending files in the directory.
 
 ---
 
@@ -135,30 +146,117 @@ Defines the primary task to perform on verified files.
 | `password` | String | Optional | Used for standard password auth OR as the second factor in MFA. |
 | `ssh_key_path` | String | Optional | Absolute path to a private SSH key (OpenSSH format). |
 | `ssh_key_passphrase` | String | Optional | The passphrase required to decrypt the private key file (if encrypted). |
+| `host_key` | String | Optional | Base64 encoded public host key for server verification (prevents MitM). |
 | `remote_path` | String | **Required** | The target directory on the SFTP server. |
-| `post_action` | String | `delete` | Local lifecycle step after successful upload (see below). |
-| `archive_path` | String | Optional | Required if `post_action` is a move or compress operation. |
 
 #### Script Handler (`action.script`)
 | Property | Type | Default | Logic / Purpose |
 | :--- | :--- | :--- | :--- |
-| `path` | String | **Required** | Absolute path to the script or executable. Supports `.exe`, `.bat`, `.ps1`, etc. |
+| `path` | String | **Required** | Absolute path to the script or executable. Supports `.exe`, `.bat`, `.cmd`, `.ps1`, etc. |
 | `timeout_seconds` | Integer | `60` | Maximum time allowed for the script to run per file before being killed. |
 
 ---
 
-### 4. Post-Action Lifecycle
+### 4. Post-Action Lifecycle (`action.post_process`)
 Determines what happens to the local file after the Action Handler confirms a successful operation.
 
+| Property | Type | Default | Logic / Purpose |
+| :--- | :--- | :--- | :--- |
+| `action` | String | `delete` | Local lifecycle step: `delete`, `move_archive`, or `move_compress`. |
+| `archive_path` | String | Optional | Required if `action` is a move or compress operation. |
+
+**Action Details:**
 *   **`delete`**: The file is permanently removed from the local `directory`.
 *   **`move_archive`**: The file is moved to a timestamped subfolder (`YYYYMMDD-HHMMSS`) under the `archive_path`.
 *   **`move_compress`**: The file is added to a high-performance, multi-threaded `zstd` archive in the `archive_path`, then the original is deleted.
 
 ---
 
+### 5. Custom Logging (`logging`)
+DirPoller implements a dual-track logging system to separate operational events from data processing results.
+
+| Property | Type | Default | Logic / Purpose |
+| :--- | :--- | :--- | :--- |
+| `log_name` | String | **Required** | Base name for the log file (e.g., `C:\Logs\poller.log`). |
+| `log_retention` | Integer | `0` | Number of days to keep logs. If `0`, retention is disabled. |
+
+#### Log Separation Concept
+1.  **System Process Log (Daily)**: Records process-level events such as service start/stop, OS resource issues, and critical system errors (e.g., SFTP connection failures).
+    - **Windows Integration**: These events are always logged to the **Windows Application Event Log** (Source: `DirPoller`). If `-log` is specified, they are also mirrored to the daily process log file.
+    - **Naming**: `base_process_YYYYMMDD.log`
+    - **Format**: `date stamp|message`
+2.  **Activity Log (Per Execution)**: Detailed report of files discovered, verified, and processed in a single cycle. Includes individual file integrity or action errors.
+    - **Windows Integration**: Activity logs are **NOT** logged to the Windows Event Log. They are file-system ONLY (requires `-log` or JSON config).
+    - **Naming**: `base_activity_YYYYMMDD-HHMMSS.log`
+    - **Format**: Structured sections for Status, Successes, and Errors.
+
+#### Example: System Process Log
+`C:\Logs\poller_process_20260310.log`
+```text
+2026-03-10 08:00:00|Engine starting...
+2026-03-10 08:05:22|ERROR: Poller error: failed to add directory to watcher
+2026-03-10 17:30:00|Engine stopping (context canceled)...
+```
+
+#### Example: Activity Log
+`C:\Logs\poller_activity_20260310-080005.log`
+```text
+# Status
+2026-03-10 08:00:05|total number of files picked up: 3
+2026-03-10 08:00:05|number of files processed OK: 2
+2026-03-10 08:00:05|number of files in error: 1
+------
+# List of files processed successfully
+2026-03-10 08:00:05|C:\Data\In\file1.txt|1024|a1b2c3d4e5f6g7h8
+2026-03-10 08:00:05|C:\Data\In\file2.txt|2048|b2c3d4e5f6g7h8i9
+------
+# List of files in error
+2026-03-10 08:00:05|C:\Data\In\file3.txt in error|512|c3d4e5f6g7h8i9j0|action execution failed
+```
+
+**Auto-Purge**: Log retention logic executes **once per day** (at the start of the first execution after 00:00:00). Both process and activity logs older than the `log_retention` period are automatically deleted to minimize filesystem overhead.
+
+### 6. Multi-Directory Support (Concurrent Services)
+DirPoller supports running multiple instances as separate Windows services. Each instance must have a unique `service_name` and a unique `poll.directory`.
+
+#### Service Name Precedence
+The service name is determined using the following priority:
+1.  **CLI Flag (`-name`)**: Overrides everything else if provided.
+2.  **Config File (`service_name`)**: Used if the CLI flag is omitted.
+3.  **Default**: Defaults to `"DirPoller"` if not specified in either.
+
+#### Installation Example
+To install two separate pollers monitoring different directories:
+
+**Instance 1 (Direct to SFTP):**
+```powershell
+.\dirpoller.exe -install -name "Poller_Finance" -config "C:\Configs\finance.json"
+```
+
+**Instance 2 (Local Script Processing):**
+```powershell
+.\dirpoller.exe -install -name "Poller_HR" -config "C:\Configs\hr.json"
+```
+
+#### Management Example
+You can then manage these services independently using their assigned names:
+```powershell
+# Start the Finance poller
+Start-Service Poller_Finance
+
+# Check status of the HR poller
+Get-Service Poller_HR
+
+# Remove the Finance poller
+.\dirpoller.exe -remove -name "Poller_Finance" -config "C:\Configs\finance.json"
+```
+
+---
+
 ### Full Configuration Example
 ```json
 {
+  "service_name": "MyCustomPoller",
   "poll": {
     "directory": "C:\\Data\\Incoming",
     "algorithm": "event"
@@ -171,15 +269,18 @@ Determines what happens to the local file after the Action Handler confirms a su
   "action": {
     "type": "sftp",
     "concurrent_connections": 4,
+    "post_process": {
+      "action": "move_compress",
+      "archive_path": "C:\\Data\\Archive"
+    },
     "sftp": {
       "host": "sftp.internal.net",
       "port": 22,
       "username": "svc_poller",
       "ssh_key_path": "C:\\ProgramData\\DirPoller\\keys\\id_ed25519",
       "ssh_key_passphrase": "my-secret-pass",
-      "remote_path": "/incoming/raw",
-      "post_action": "move_compress",
-      "archive_path": "C:\\Data\\Archive"
+      "host_key": "AAAA...",
+      "remote_path": "/incoming/raw"
     }
   }
 }
@@ -195,6 +296,7 @@ $env:CGO_ENABLED="0"
 
 # Production Build Command
 $version = Get-Content version.txt
+if (-not (Test-Path ./bin)) { New-Item -ItemType Directory -Path ./bin }
 go build -v `
     -buildvcs=false `
     -trimpath `
@@ -219,9 +321,9 @@ go build -v `
 ## Examples
 
 ### 1. Interactive CLI Mode
-Run DirPoller directly in your terminal to monitor a directory and see processing results in real-time.
+Run DirPoller directly in your terminal to monitor a directory.
 ```powershell
-.\dirpoller.exe -config "C:\Configs\prod_config.json"
+.\dirpoller.exe -config "C:\Configs\prod_config.json" -log "C:\Logs\poller.log" -log-retention 7
 ```
 
 ### 2. Troubleshooting with Debug Mode
@@ -247,3 +349,19 @@ Stop and uninstall the service from the system.
 ```powershell
 .\dirpoller.exe -remove -config "C:\DirPoller\config.json"
 ```
+
+## Unit Tests
+DirPoller includes a comprehensive unit testing suite designed for high reliability and realistic Windows behavior.
+
+### Objectives
+- **Realistic Simulation**: Tests use the Windows `%TEMP%` directory for real filesystem interactions.
+- **Isolated Testing**: All external dependencies (SFTP, Windows Service Manager) are refactored into interfaces and fully mocked, allowing for complete logic verification without specialized infrastructure or administrator rights.
+- **Race Condition Prevention**: Test subdirectories are uniquely isolated per-test to support parallel execution.
+
+### Running Tests
+To run the entire test suite and verify code coverage:
+```powershell
+go test ./internal/... -v -cover
+```
+
+For more detailed information on test categories and specific test cases, see the [TESTING.md](./TESTING.md) file.

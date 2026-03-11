@@ -19,6 +19,8 @@ const (
 	PollBatch PollAlgorithm = "batch"
 	// PollEvent uses OS-native events (ReadDirectoryChangesW) for real-time detection.
 	PollEvent PollAlgorithm = "event"
+	// PollTrigger waits for a specific trigger file to appear.
+	PollTrigger PollAlgorithm = "trigger"
 )
 
 // IntegrityAlgorithm defines the methods used to ensure a file is fully written and consistent.
@@ -57,16 +59,24 @@ const (
 
 // Config represents the root configuration structure for the DirPoller application.
 type Config struct {
-	Poll      PollConfig      `json:"poll"`
-	Integrity IntegrityConfig `json:"integrity"`
-	Action    ActionConfig    `json:"action"`
+	ServiceName string          `json:"service_name,omitempty"`
+	Poll        PollConfig      `json:"poll"`
+	Integrity   IntegrityConfig `json:"integrity"`
+	Action      ActionConfig    `json:"action"`
+	Logging     []LoggingConfig `json:"logging,omitempty"`
+}
+
+// LoggingConfig contains parameters for the custom logging facility.
+type LoggingConfig struct {
+	LogName      string `json:"log_name"`
+	LogRetention int    `json:"log_retention"` // in days
 }
 
 // PollConfig contains parameters for the directory scanning engine.
 type PollConfig struct {
 	Directory           string        `json:"directory"`
 	Algorithm           PollAlgorithm `json:"algorithm"`
-	Value               int           `json:"value"` // Interval in seconds or Batch count
+	Value               interface{}   `json:"value"` // Interval/Batch count (int) or Trigger pattern (string)
 	BatchTimeoutSeconds int           `json:"batch_timeout_seconds"`
 }
 
@@ -79,23 +89,29 @@ type IntegrityConfig struct {
 
 // ActionConfig contains parameters for the upload or execution phase.
 type ActionConfig struct {
-	Type                  ActionType   `json:"type"`
-	ConcurrentConnections int          `json:"concurrent_connections"`
-	SFTP                  SFTPConfig   `json:"sftp,omitempty"`
-	Script                ScriptConfig `json:"script,omitempty"`
+	Type                  ActionType        `json:"type"`
+	ConcurrentConnections int               `json:"concurrent_connections"`
+	PostProcess           PostProcessConfig `json:"post_process"`
+	SFTP                  SFTPConfig        `json:"sftp,omitempty"`
+	Script                ScriptConfig      `json:"script,omitempty"`
+}
+
+// PostProcessConfig contains parameters for the file lifecycle after action execution.
+type PostProcessConfig struct {
+	Action      PostAction `json:"action"`
+	ArchivePath string     `json:"archive_path,omitempty"`
 }
 
 // SFTPConfig contains credentials and path information for SFTP transfers.
 type SFTPConfig struct {
-	Host             string     `json:"host"`
-	Port             int        `json:"port"`
-	Username         string     `json:"username"`
-	Password         string     `json:"password,omitempty"`           // #nosec G117 - Authentication password
-	SSHKeyPath       string     `json:"ssh_key_path,omitempty"`       // Path to private key
-	SSHKeyPassphrase string     `json:"ssh_key_passphrase,omitempty"` // #nosec G117 - Passphrase to decrypt the private key
-	RemotePath       string     `json:"remote_path"`
-	PostAction       PostAction `json:"post_action"`
-	ArchivePath      string     `json:"archive_path,omitempty"`
+	Host             string `json:"host"`
+	Port             int    `json:"port"`
+	Username         string `json:"username"`
+	Password         string `json:"password,omitempty"`           // #nosec G117 - Authentication password
+	SSHKeyPath       string `json:"ssh_key_path,omitempty"`       // Path to private key
+	SSHKeyPassphrase string `json:"ssh_key_passphrase,omitempty"` // #nosec G117 - Passphrase to decrypt the private key
+	HostKey          string `json:"host_key,omitempty"`           // Base64 encoded public host key
+	RemotePath       string `json:"remote_path"`
 }
 
 // ScriptConfig contains parameters for executing external logic.
@@ -126,10 +142,13 @@ func LoadConfig(path string) (*Config, error) {
 }
 
 func setDefaults(cfg *Config) {
+	if cfg.ServiceName == "" {
+		cfg.ServiceName = "DirPoller"
+	}
 	if cfg.Poll.Algorithm == "" {
 		cfg.Poll.Algorithm = PollInterval
 	}
-	if cfg.Poll.Algorithm == PollBatch && cfg.Poll.BatchTimeoutSeconds == 0 {
+	if (cfg.Poll.Algorithm == PollBatch || cfg.Poll.Algorithm == PollTrigger) && cfg.Poll.BatchTimeoutSeconds == 0 {
 		cfg.Poll.BatchTimeoutSeconds = 600 // 10 minutes default
 	}
 
@@ -146,6 +165,10 @@ func setDefaults(cfg *Config) {
 	if cfg.Action.ConcurrentConnections == 0 {
 		cfg.Action.ConcurrentConnections = runtime.NumCPU() * 2
 	}
+
+	if cfg.Action.PostProcess.Action == "" {
+		cfg.Action.PostProcess.Action = PostActionDelete
+	}
 }
 
 func validate(cfg *Config) error {
@@ -157,9 +180,15 @@ func validate(cfg *Config) error {
 	}
 
 	switch cfg.Poll.Algorithm {
-	case PollInterval, PollBatch, PollEvent:
+	case PollInterval, PollBatch, PollEvent, PollTrigger:
 	default:
 		return fmt.Errorf("unsupported poll algorithm: %s", cfg.Poll.Algorithm)
+	}
+
+	if cfg.Poll.Algorithm == PollTrigger {
+		if _, ok := cfg.Poll.Value.(string); !ok {
+			return fmt.Errorf("trigger algorithm requires a string value for file pattern")
+		}
 	}
 
 	switch cfg.Integrity.Algorithm {

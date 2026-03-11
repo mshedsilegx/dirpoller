@@ -3,13 +3,16 @@ package action
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
 
 	"criticalsys.net/dirpoller/internal/config"
+	"encoding/base64"
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 )
@@ -22,11 +25,38 @@ type ActionHandler interface {
 	Execute(ctx context.Context, files []string) ([]string, error)
 }
 
+// SFTPClient defines the subset of sftp.Client methods used by SFTPHandler.
+type SFTPClient interface {
+	MkdirAll(path string) error
+	Create(path string) (SFTPFile, error)
+	Getwd() (string, error)
+	Close() error
+}
+
+// SFTPFile defines the subset of sftp.File methods used by SFTPHandler.
+type SFTPFile interface {
+	io.Writer
+	io.Closer
+}
+
+// SSHClient defines the subset of ssh.Client methods used by SFTPHandler.
+type SSHClient interface {
+	Close() error
+}
+
+type sftpClientWrapper struct {
+	*sftp.Client
+}
+
+func (w *sftpClientWrapper) Create(path string) (SFTPFile, error) {
+	return w.Client.Create(path)
+}
+
 // SFTPHandler manages persistent multi-threaded file uploads to a remote SFTP server.
 type SFTPHandler struct {
 	cfg       *config.Config
-	client    *sftp.Client
-	conn      *ssh.Client
+	client    SFTPClient
+	conn      SSHClient
 	mu        sync.Mutex
 	semaphore chan struct{}
 }
@@ -84,13 +114,17 @@ func (h *SFTPHandler) Execute(ctx context.Context, files []string) ([]string, er
 	}
 
 	if len(errChan) > 0 {
-		return successfulFiles, <-errChan // Return successful ones and the first error encountered
+		var errs []error
+		for e := range errChan {
+			errs = append(errs, e)
+		}
+		return successfulFiles, errors.Join(errs...)
 	}
 
 	return successfulFiles, nil
 }
 
-func (h *SFTPHandler) getOrCreateClient() (*sftp.Client, error) {
+func (h *SFTPHandler) getOrCreateClient() (SFTPClient, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
@@ -103,7 +137,7 @@ func (h *SFTPHandler) getOrCreateClient() (*sftp.Client, error) {
 		// Connection lost, cleanup and reconnect
 		if err := h.closeNoLock(); err != nil {
 			// Log error but continue to attempt reconnect
-			fmt.Printf("Error closing lost SFTP connection: %v\n", err)
+			log.Printf("Error closing lost SFTP connection: %v\n", err)
 		}
 	}
 
@@ -116,7 +150,7 @@ func (h *SFTPHandler) getOrCreateClient() (*sftp.Client, error) {
 	return h.client, nil
 }
 
-func (h *SFTPHandler) connect() (*sftp.Client, *ssh.Client, error) {
+func (h *SFTPHandler) connect() (SFTPClient, SSHClient, error) {
 	var authMethods []ssh.AuthMethod
 
 	// Support SSH Key
@@ -144,10 +178,25 @@ func (h *SFTPHandler) connect() (*sftp.Client, *ssh.Client, error) {
 		authMethods = append(authMethods, ssh.Password(h.cfg.Action.SFTP.Password))
 	}
 
+	var hostKeyCallback ssh.HostKeyCallback
+	if h.cfg.Action.SFTP.HostKey != "" {
+		pubKeyData, err := base64.StdEncoding.DecodeString(h.cfg.Action.SFTP.HostKey)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to decode host key: %w", err)
+		}
+		pubKey, err := ssh.ParsePublicKey(pubKeyData)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to parse host key: %w", err)
+		}
+		hostKeyCallback = ssh.FixedHostKey(pubKey)
+	} else {
+		hostKeyCallback = ssh.InsecureIgnoreHostKey() // #nosec G106 - Fallback if not provided
+	}
+
 	sshConfig := &ssh.ClientConfig{
 		User:            h.cfg.Action.SFTP.Username,
 		Auth:            authMethods,
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // #nosec G106 - In production, use proper host key verification
+		HostKeyCallback: hostKeyCallback,
 	}
 
 	addr := fmt.Sprintf("%s:%d", h.cfg.Action.SFTP.Host, h.cfg.Action.SFTP.Port)
@@ -164,17 +213,17 @@ func (h *SFTPHandler) connect() (*sftp.Client, *ssh.Client, error) {
 		return nil, nil, fmt.Errorf("failed to create SFTP client: %w", err)
 	}
 
-	return client, conn, nil
+	return &sftpClientWrapper{client}, conn, nil
 }
 
-func (h *SFTPHandler) uploadFile(client *sftp.Client, localPath string) error {
+func (h *SFTPHandler) uploadFile(client SFTPClient, localPath string) error {
 	src, err := os.Open(filepath.Clean(localPath)) // #nosec G304
 	if err != nil {
 		return err
 	}
 	defer func() {
 		if closeErr := src.Close(); closeErr != nil {
-			fmt.Printf("Warning: failed to close source file %s: %v\n", localPath, closeErr)
+			log.Printf("Warning: failed to close source file %s: %v\n", localPath, closeErr)
 		}
 	}()
 
@@ -185,7 +234,7 @@ func (h *SFTPHandler) uploadFile(client *sftp.Client, localPath string) error {
 	}
 	defer func() {
 		if closeErr := dst.Close(); closeErr != nil {
-			fmt.Printf("Warning: failed to close remote file %s: %v\n", remotePath, closeErr)
+			log.Printf("Warning: failed to close remote file %s: %v\n", remotePath, closeErr)
 		}
 	}()
 

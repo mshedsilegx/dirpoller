@@ -1,0 +1,31 @@
+Results:
+
+
+[[30;43me:\data\devel\build\code\private\dirpoller\internal\service\custom_logger.go:77[0m] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    76: 
+  > 77: 	f, err := os.Create(logFileName)
+    78: 	if err != nil {
+
+Autofix: Consider using os.Root to scope file access under a fixed root (Go >=1.24). Prefer root.Open/root.Stat over os.Open/os.Stat to prevent directory traversal.
+
+[[30;43me:\data\devel\build\code\private\dirpoller\internal\service\custom_logger.go:51[0m] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    50: 
+  > 51: 	f, err := os.OpenFile(logFileName, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+    52: 	if err != nil {
+
+Autofix: Consider using os.Root to scope file access under a fixed root (Go >=1.24). Prefer root.Open/root.Stat over os.Open/os.Stat to prevent directory traversal.
+
+[[30;43me:\data\devel\build\code\private\dirpoller\internal\service\custom_logger.go:51[0m] - G302 (CWE-276): Expect file permissions to be 0600 or less (Confidence: HIGH, Severity: MEDIUM)
+    50: 
+  > 51: 	f, err := os.OpenFile(logFileName, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+    52: 	if err != nil {
+
+Autofix: 
+
+[1;36mSummary:[0m
+  Gosec  : 2.24.7
+  Files  : 17
+  Lines  : 2278
+  Nosec  : 9
+  Issues : [1;31m3[0m
+

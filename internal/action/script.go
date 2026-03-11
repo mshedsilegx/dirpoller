@@ -2,6 +2,7 @@ package action
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"path/filepath"
@@ -60,7 +61,11 @@ func (h *ScriptHandler) Execute(ctx context.Context, files []string) ([]string, 
 	}
 
 	if len(errChan) > 0 {
-		return successfulFiles, <-errChan
+		var errs []error
+		for e := range errChan {
+			errs = append(errs, e)
+		}
+		return successfulFiles, errors.Join(errs...)
 	}
 	return successfulFiles, nil
 }
