@@ -25,19 +25,22 @@ type EngineLogger interface {
 }
 
 // Engine orchestrates the polling, verification, and action execution lifecycle.
+// It acts as the central controller, routing events between the poller, verifier, action handler, and loggers.
 type Engine struct {
-	cfg       *config.Config
-	poller    poller.Poller
-	verifier  *integrity.Verifier
-	handler   action.ActionHandler
-	archiver  *archive.Archiver
-	isService bool
-	logger    EngineLogger
-	customLog *CustomLogger
+	cfg       *config.Config       // Application configuration
+	poller    poller.Poller        // The selected polling algorithm (Interval, Batch, Event, or Trigger)
+	verifier  *integrity.Verifier  // Logic for ensuring files are fully committed
+	handler   action.ActionHandler // The primary action (SFTP or local Script)
+	archiver  *archive.Archiver    // Post-processing logic (Delete, Move, or Compress)
+	isService bool                 // Indicates if running as a native Windows Service
+	logger    EngineLogger         // System event logger (Windows Event Log or Console)
+	customLog *CustomLogger        // File-based dual-track logger (if enabled)
 }
 
 // NewEngine initializes the core processing engine with configured components.
+// It maps configuration directives to specific interface implementations.
 func NewEngine(cfg *config.Config, isService bool) (*Engine, error) {
+	// 1. Initialize Polling Algorithm
 	var p poller.Poller
 	switch cfg.Poll.Algorithm {
 	case config.PollInterval:
@@ -52,6 +55,7 @@ func NewEngine(cfg *config.Config, isService bool) (*Engine, error) {
 		return nil, fmt.Errorf("unsupported poller algorithm: %s", cfg.Poll.Algorithm)
 	}
 
+	// 2. Initialize Primary Action Handler
 	var handler action.ActionHandler
 	switch cfg.Action.Type {
 	case config.ActionSFTP:
@@ -62,9 +66,11 @@ func NewEngine(cfg *config.Config, isService bool) (*Engine, error) {
 		return nil, fmt.Errorf("unsupported action type: %s", cfg.Action.Type)
 	}
 
+	// 3. Initialize System Logger (EventLog for Services, CLI for manual runs)
 	var logger EngineLogger
 	if isService {
 		var err error
+		// "DirPoller" is the registered event source name
 		platLogger, err := NewPlatformLogger("DirPoller", true)
 		if err != nil {
 			return nil, fmt.Errorf("failed to open platform logger: %w", err)
@@ -74,6 +80,7 @@ func NewEngine(cfg *config.Config, isService bool) (*Engine, error) {
 		logger = &cliLogger{}
 	}
 
+	// 4. Initialize Optional File-based Logger
 	var customLog *CustomLogger
 	if len(cfg.Logging) > 0 {
 		customLog = NewCustomLogger(cfg.Logging[0].LogName, cfg.Logging[0].LogRetention)
@@ -91,11 +98,14 @@ func NewEngine(cfg *config.Config, isService bool) (*Engine, error) {
 	}, nil
 }
 
+// Run starts the infinite polling loop. It manages the lifecycle of the poller
+// and coordinates the transition of file batches to the processing pipeline.
 func (e *Engine) Run(ctx context.Context) error {
 	e.logProcess("Engine starting...")
 	results := make(chan []string)
 	errChan := make(chan error, 1)
 
+	// Start the poller in its own goroutine
 	go func() {
 		if err := e.poller.Start(ctx, results); err != nil {
 			errChan <- err
@@ -110,8 +120,9 @@ func (e *Engine) Run(ctx context.Context) error {
 		case err := <-errChan:
 			e.logError(fmt.Sprintf("Poller error: %v", err))
 			if e.isService {
-				// In service mode, log the error and wait for the next polling cycle
-				// by restarting the poller.
+				// SECTION: Service Resilience
+				// As per specs.txt, the service should log errors and continue.
+				// We restart the poller to attempt recovery in the next cycle.
 				e.logProcess("Restarting poller after error...")
 				go func() {
 					if err := e.poller.Start(ctx, results); err != nil {
@@ -122,11 +133,13 @@ func (e *Engine) Run(ctx context.Context) error {
 			}
 			return err
 		case files := <-results:
+			// Pipeline step: Hand off discovered files for verification and execution
 			e.processFiles(ctx, files)
 		}
 	}
 }
 
+// processFiles coordinates the concurrent verification and sequential execution of a file batch.
 func (e *Engine) processFiles(ctx context.Context, files []string) {
 	summary := ExecutionSummary{
 		StartTime: time.Now(),
@@ -135,7 +148,8 @@ func (e *Engine) processFiles(ctx context.Context, files []string) {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 
-	// Concurrent integrity verification with context awareness
+	// STEP 1: CONCURRENT INTEGRITY VERIFICATION
+	// Each file is checked across N attempts to ensure it's not being modified.
 	for _, f := range files {
 		wg.Add(1)
 		go func(path string) {
@@ -143,7 +157,7 @@ func (e *Engine) processFiles(ctx context.Context, files []string) {
 
 			ok, err := e.verifier.Verify(ctx, path)
 			if err != nil {
-				// File-specific error: goes ONLY to activity log (via summary)
+				// Individual file errors go to the Activity Log, not the System Event Log
 				mu.Lock()
 				summary.Errors = append(summary.Errors, FileProcessInfo{
 					Path:  path,
@@ -162,19 +176,20 @@ func (e *Engine) processFiles(ctx context.Context, files []string) {
 
 	wg.Wait()
 
+	// Exit early if nothing to do
 	if len(verifiedFiles) == 0 && len(summary.Errors) == 0 {
 		return
 	}
 
+	// STEP 2: ACTION EXECUTION (SFTP OR SCRIPT)
 	if len(verifiedFiles) > 0 {
 		processedFiles, err := e.handler.Execute(ctx, verifiedFiles)
 		if err != nil {
-			// System-level error (e.g., SFTP connection failure): goes to Event Log and Process Log
+			// System-level action failures (e.g., SFTP down) are logged to the System Event Log
 			e.logError(fmt.Sprintf("Action execution failed: %v", err))
 		}
 
-		// Track processed and errors from handler
-		// Note: handler.Execute returns files that were successfully processed
+		// Update activity summary with results from the handler
 		successMap := make(map[string]bool)
 		for _, f := range processedFiles {
 			successMap[f] = true
@@ -189,6 +204,8 @@ func (e *Engine) processFiles(ctx context.Context, files []string) {
 			}
 		}
 
+		// STEP 3: POST-PROCESSING (ARCHIVE/DELETE)
+		// Only performed on files successfully handled in Step 2.
 		if len(processedFiles) > 0 {
 			if err := e.archiver.Process(ctx, processedFiles); err != nil {
 				e.logError(fmt.Sprintf("Post-processing failed: %v", err))
@@ -196,8 +213,9 @@ func (e *Engine) processFiles(ctx context.Context, files []string) {
 		}
 	}
 
+	// STEP 4: ACTIVITY LOGGING
+	// Writes the per-execution report to the file system (if configured).
 	if e.customLog != nil {
-		// LogExecution handles only the activity log file, NO EventLog mirroring
 		if err := e.customLog.LogExecution(summary); err != nil {
 			e.logError(fmt.Sprintf("Failed to write activity log: %v", err))
 		}
@@ -231,15 +249,6 @@ func (e *Engine) logError(msg string) {
 		}
 	} else {
 		log.Println(msg)
-	}
-}
-
-func (e *Engine) logWarn(msg string) {
-	e.logProcess("WARN: " + msg)
-	if e.logger != nil {
-		e.logger.Warn(msg)
-	} else {
-		log.Printf("Warning: %s", msg)
 	}
 }
 

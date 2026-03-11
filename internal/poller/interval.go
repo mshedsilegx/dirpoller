@@ -6,6 +6,8 @@ import (
 	"time"
 )
 
+// IntervalPoller discovers files by performing a full directory scan at fixed time steps.
+// This is the most reliable algorithm for all storage types (local, network, cloud).
 type IntervalPoller struct {
 	cfg   *config.Config
 	utils OSUtils
@@ -44,6 +46,8 @@ func (p *IntervalPoller) Start(ctx context.Context, results chan<- []string) err
 	}
 }
 
+// poll performs a single scan of the directory. It enforces the non-recursive requirement
+// before collecting and sending files to the results channel.
 func (p *IntervalPoller) poll(results chan<- []string) error {
 	if _, err := p.utils.HasSubfolders(p.cfg.Poll.Directory); err != nil {
 		return err

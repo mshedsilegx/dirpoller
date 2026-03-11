@@ -12,6 +12,9 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
+// TriggerPoller waits for a specific "trigger file" (exact name or wildcard) to appear.
+// Once detected, it processes all other files currently pending in the directory.
+// It also includes a timeout fallback to process files if the trigger never arrives.
 type TriggerPoller struct {
 	cfg   *config.Config
 	utils OSUtils

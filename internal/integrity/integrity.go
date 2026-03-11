@@ -16,6 +16,8 @@ import (
 )
 
 // Verifier orchestrates multiple attempts to ensure file integrity.
+// A file is considered "stable" only if its property (size, timestamp, or hash)
+// remains unchanged across N consecutive attempts at specific intervals.
 type Verifier struct {
 	cfg   *config.Config
 	utils poller.OSUtils
@@ -30,8 +32,8 @@ func NewVerifier(cfg *config.Config) *Verifier {
 }
 
 // Verify checks file consistency across multiple attempts.
-// It uses the configured algorithm (Hash, Timestamp, or Size) to detect changes.
-// A file is considered "verified" only if its property remains unchanged across N attempts.
+// 1. First checks for Windows-native file locks.
+// 2. Performs the stability check using the configured algorithm.
 func (v *Verifier) Verify(ctx context.Context, path string) (bool, error) {
 	for i := 0; i < v.cfg.Integrity.VerificationAttempts; i++ {
 		// 1. Check Windows lock first
@@ -89,6 +91,7 @@ func (v *Verifier) getIntegrityValue(path string) (string, error) {
 }
 
 // CalculateHash calculates the xxHash-64 of a file.
+// This is used for both the stability check algorithm and for logging in the activity report.
 func (v *Verifier) CalculateHash(path string) (string, error) {
 	return v.calculateHash(path)
 }

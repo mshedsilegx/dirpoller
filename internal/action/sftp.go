@@ -53,6 +53,7 @@ func (w *sftpClientWrapper) Create(path string) (SFTPFile, error) {
 }
 
 // SFTPHandler manages persistent multi-threaded file uploads to a remote SFTP server.
+// It uses a semaphore pool to limit concurrent connections and supports SSH Key/Password MFA.
 type SFTPHandler struct {
 	cfg       *config.Config
 	client    SFTPClient

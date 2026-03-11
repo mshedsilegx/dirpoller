@@ -12,6 +12,8 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
+// EventPoller uses Windows-native ReadDirectoryChangesW (via fsnotify) for real-time detection.
+// It is optimized for high-traffic local disks where minimal latency is required.
 type EventPoller struct {
 	cfg   *config.Config
 	utils OSUtils

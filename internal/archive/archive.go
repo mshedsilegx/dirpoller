@@ -16,6 +16,7 @@ import (
 )
 
 // Archiver manages the cleanup and archiving of successfully processed files.
+// It supports permanent deletion, moving to datestamped folders, or consolidation into .tar.zst archives.
 type Archiver struct {
 	cfg *config.Config
 }
@@ -75,6 +76,10 @@ func (a *Archiver) moveToFolder(ctx context.Context, files []string) error {
 	return nil
 }
 
+// compressToArchive consolidates multiple files into a single standard .tar.zst archive.
+// 1. Creates a tar container.
+// 2. Compresses the stream using multi-threaded zstd.
+// 3. Deletes the original files upon success.
 func (a *Archiver) compressToArchive(ctx context.Context, files []string) error {
 	datestamp := time.Now().Format("20060102-150405.000000")
 	archiveName := fmt.Sprintf("batch-%s.zst", datestamp)

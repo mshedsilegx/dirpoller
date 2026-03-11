@@ -13,6 +13,7 @@ import (
 )
 
 // ScriptHandler executes local scripts for processed files.
+// It uses a semaphore pool to control concurrency and enforces an execution timeout.
 type ScriptHandler struct {
 	cfg       *config.Config
 	semaphore chan struct{}
@@ -75,6 +76,8 @@ func (h *ScriptHandler) Close() error {
 	return nil
 }
 
+// executeScript runs the configured script for a single file.
+// It uses an absolute path for security and a context timeout for reliability.
 func (h *ScriptHandler) executeScript(ctx context.Context, file string) error {
 	// Security: Use absolute path and validate file exists
 	absFile, err := filepath.Abs(file)

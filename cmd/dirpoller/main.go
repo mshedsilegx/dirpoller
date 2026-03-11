@@ -18,6 +18,9 @@ import (
 
 var version = "dev"
 
+// main is the entry point for the DirPoller application.
+// It handles CLI flag parsing, Windows service installation/removal,
+// and orchestrates the transition between CLI and Service run modes.
 func main() {
 	configPath := flag.String("config", "", "Path to JSON configuration file")
 	install := flag.Bool("install", false, "Install as Windows service")
@@ -124,6 +127,8 @@ func main() {
 	fmt.Println("DirPoller CLI stopped gracefully.")
 }
 
+// isAdmin checks if the current process is running with administrative privileges.
+// This is required for installing or removing Windows services and EventLog sources.
 func isAdmin() bool {
 	var sid *windows.SID
 	err := windows.AllocateAndInitializeSid(

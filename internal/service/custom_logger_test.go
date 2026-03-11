@@ -103,7 +103,9 @@ func TestCustomLogger_PurgeOldLogs(t *testing.T) {
 	}
 	testDir := filepath.Join(tempDir, "dirpoller_UTESTS", "logger_purge")
 	_ = os.MkdirAll(testDir, 0750)
-	defer os.RemoveAll(testDir)
+	defer func() {
+		_ = os.RemoveAll(testDir)
+	}()
 
 	logName := filepath.Join(testDir, "test.log")
 	logger := NewCustomLogger(logName, 2) // 2 days retention

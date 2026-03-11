@@ -10,6 +10,9 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
+// BatchPoller collects files as they arrive but waits until a specific volume (file count)
+// is reached before executing actions. It uses file system notifications for low-latency detection
+// and a timeout fallback to ensure files are not stranded.
 type BatchPoller struct {
 	cfg   *config.Config
 	utils OSUtils
@@ -105,6 +108,7 @@ func (p *BatchPoller) checkThreshold(results chan<- []string) bool {
 	return false
 }
 
+// flush sends all currently collected files as a single batch and clears the internal map.
 func (p *BatchPoller) flush(results chan<- []string) {
 	batch := make([]string, 0, len(p.files))
 	for f := range p.files {
