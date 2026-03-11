@@ -282,7 +282,13 @@ Get-Service Poller_HR
       "host_key": "AAAA...",
       "remote_path": "/incoming/raw"
     }
-  }
+  },
+  "logging": [
+    {
+      "log_name": "C:\\Logs\\poller.log",
+      "log_retention": 7
+    }
+  ]
 }
 ```
 
@@ -348,6 +354,12 @@ Install as a background service using a dedicated service account.
 Stop and uninstall the service from the system.
 ```powershell
 .\dirpoller.exe -remove -config "C:\DirPoller\config.json"
+```
+
+### 6. Configuration with Logging
+Run DirPoller with custom logging and 14-day retention.
+```powershell
+.\dirpoller.exe -config "C:\Configs\prod_config.json" -log "C:\Logs\prod_poller.log" -log-retention 14
 ```
 
 ## Unit Tests
