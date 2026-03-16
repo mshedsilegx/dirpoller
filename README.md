@@ -329,7 +329,7 @@ go build -v `
 ### 1. Interactive CLI Mode
 Run DirPoller directly in your terminal to monitor a directory.
 ```powershell
-.\dirpoller.exe -config "C:\Configs\prod_config.json" -log "C:\Logs\poller.log" -log-retention 7
+.\dirpoller.exe -config "C:\Configs\prod_config.json"
 ```
 
 ### 2. Troubleshooting with Debug Mode
