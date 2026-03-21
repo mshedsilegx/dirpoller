@@ -1,21 +1,81 @@
 //go:build linux
 
+// Package poller (Linux) provides Linux-native implementations for directory monitoring.
+//
+// Objective:
+// Implement the OSUtils interface using Linux-native system calls and standard library functions
+// to ensure robust file locking and non-recursive directory scanning.
+//
+// Core Functionality:
+// - File Locking: Uses the flock system call for advisory file locking.
+// - Directory Scanning: Uses standard POSIX-compliant directory reading.
+//
+// Data Flow:
+// 1. Locking: IsLocked attempts to acquire a non-blocking exclusive lock via flock.
+// 2. Constraints: HasSubfolders and GetFiles enforce the non-recursive directory requirement.
 package poller
 
 import (
 	"fmt"
 	"os"
+	"path/filepath"
+
+	"golang.org/x/sys/unix"
 )
 
+// linuxOSUtils provides Linux-native implementations for file locking and directory scanning.
+//
+// Objective: Maintain cross-platform parity by implementing native Linux logic
+// for directory constraints and file integrity.
 type linuxOSUtils struct{}
 
 func newOSUtils() OSUtils {
 	return &linuxOSUtils{}
 }
 
+// IsLocked checks if a file is locked by another process using flock.
+//
+// Objective: Detect active writes or locks on Linux to prevent processing
+// incomplete files.
+//
+// Logic:
+// - Opens the file for reading.
+// - Performs an os.Stat to check if the path is a directory.
+// - Attempts to acquire an exclusive lock (LOCK_EX) in non-blocking mode (LOCK_NB).
+// - If flock fails with EWOULDBLOCK or EAGAIN, the file is considered locked.
 func (l *linuxOSUtils) IsLocked(path string) (bool, error) {
-	// Linux specific lock check (e.g., flock or checking /proc/locks)
-	// For now, return false as stub
+	// 1. Initial Stat to check if it's a directory
+	stat, err := os.Stat(path)
+	if err != nil {
+		return false, err
+	}
+	if stat.IsDir() {
+		return false, fmt.Errorf("IsLocked: %s is a directory", path)
+	}
+
+	f, err := os.Open(filepath.Clean(path))
+	if err != nil {
+		return false, err
+	}
+	defer func() {
+		_ = f.Close()
+	}()
+
+	// Try to acquire an exclusive lock in non-blocking mode.
+	// If another process has the file open/locked, this will fail.
+	fd := f.Fd()
+	// #nosec G115 - file descriptor conversion is safe on Linux
+	err = unix.Flock(int(fd), unix.LOCK_EX|unix.LOCK_NB)
+	if err != nil {
+		if err == unix.EWOULDBLOCK || err == unix.EAGAIN {
+			return true, nil
+		}
+		return false, fmt.Errorf("flock failed for %s: %w", path, err)
+	}
+
+	// Lock acquired successfully, release it.
+	// #nosec G115 - file descriptor conversion is safe on Linux
+	_ = unix.Flock(int(fd), unix.LOCK_UN)
 	return false, nil
 }
 
@@ -27,7 +87,7 @@ func (l *linuxOSUtils) HasSubfolders(dir string) (bool, error) {
 
 	for _, entry := range entries {
 		if entry.IsDir() {
-			return true, fmt.Errorf("subfolder detected: %s", entry.Name())
+			return true, &ErrSubfolderDetected{Path: entry.Name()}
 		}
 	}
 
@@ -43,9 +103,9 @@ func (l *linuxOSUtils) GetFiles(dir string) ([]string, error) {
 
 	for _, entry := range entries {
 		if entry.IsDir() {
-			return nil, fmt.Errorf("subfolder detected: %s", entry.Name())
+			return nil, &ErrSubfolderDetected{Path: entry.Name()}
 		}
-		files = append(files, dir+"/"+entry.Name())
+		files = append(files, filepath.Join(dir, entry.Name()))
 	}
 
 	return files, nil

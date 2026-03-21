@@ -1,8 +1,26 @@
 // Package integrity provides logic for verifying that files are fully written and consistent.
+//
+// Objective:
+// Ensure that files discovered by the poller are "stable" and fully committed to
+// disk before processing. This prevents partial transfers of files that are still
+// being written or are locked by other processes.
+//
+// Core Components:
+// - Verifier: Orchestrates stability checks across multiple attempts.
+// - OSUtils: Platform-specific logic for robust lock detection.
+//
+// Data Flow:
+// 1. Discovery: The Engine receives a batch of files from the Poller.
+// 2. Hand-off: The Engine passes file paths to the Verifier.
+// 3. Lock Check: Verifier uses OSUtils.IsLocked to check for native file locks.
+// 4. Stability Sampling: Verifier records a file property (size, timestamp, or hash).
+// 5. Verification: After an interval, the property is sampled again and compared.
+// 6. Approval: Returns true only if the file remains unchanged across N attempts.
 package integrity
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
@@ -12,7 +30,7 @@ import (
 
 	"criticalsys.net/dirpoller/internal/config"
 	"criticalsys.net/dirpoller/internal/poller"
-	"github.com/cespare/xxhash/v2"
+	"github.com/zeebo/xxh3"
 )
 
 // Verifier orchestrates multiple attempts to ensure file integrity.
@@ -32,14 +50,20 @@ func NewVerifier(cfg *config.Config) *Verifier {
 }
 
 // Verify checks file consistency across multiple attempts.
-// 1. First checks for Windows-native file locks.
-// 2. Performs the stability check using the configured algorithm.
+//
+// Logic:
+//  1. Lock Check: Uses platform-native APIs (e.g., Windows CreateFile with FILE_SHARE_NONE)
+//     to see if the file is currently held by another process.
+//  2. Initial Sample: Captures the configured integrity property (Size, Timestamp, or XXH3-128 Hash).
+//  3. Interval Wait: Pauses execution for the configured VerificationInterval.
+//  4. Comparison: Re-samples the property and compares with the previous value.
+//  5. Success: Returns true if the property is stable across all configured VerificationAttempts.
 func (v *Verifier) Verify(ctx context.Context, path string) (bool, error) {
 	for i := 0; i < v.cfg.Integrity.VerificationAttempts; i++ {
 		// 1. Check Windows lock first
 		locked, err := v.utils.IsLocked(path)
 		if err != nil {
-			return false, fmt.Errorf("failed to check lock for %s: %w", path, err)
+			return false, fmt.Errorf("[Integrity:Verify] failed to check lock for %s: %w", path, err)
 		}
 		if locked {
 			return false, nil // File is locked, retry later
@@ -86,11 +110,11 @@ func (v *Verifier) getIntegrityValue(path string) (string, error) {
 	case config.IntegrityHash:
 		return v.calculateHash(path)
 	default:
-		return "", fmt.Errorf("unsupported integrity algorithm: %s", v.cfg.Integrity.Algorithm)
+		return "", fmt.Errorf("[Integrity:Algorithm] unsupported integrity algorithm: %s", v.cfg.Integrity.Algorithm)
 	}
 }
 
-// CalculateHash calculates the xxHash-64 of a file.
+// CalculateHash calculates the XXH3-128 of a file.
 // This is used for both the stability check algorithm and for logging in the activity report.
 func (v *Verifier) CalculateHash(path string) (string, error) {
 	return v.calculateHash(path)
@@ -107,10 +131,11 @@ func (v *Verifier) calculateHash(path string) (string, error) {
 		}
 	}()
 
-	h := xxhash.New()
-	if _, err := io.Copy(h, f); err != nil {
+	h := xxh3.New128()
+	buf := make([]byte, 1*1024*1024)
+	if _, err := io.CopyBuffer(h, f, buf); err != nil {
 		return "", err
 	}
 
-	return fmt.Sprintf("%x", h.Sum64()), nil
+	return hex.EncodeToString(h.Sum(nil)), nil
 }

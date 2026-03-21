@@ -1,8 +1,19 @@
+// Package poller (Batch) implements the volume-based batching strategy.
+//
+// Objective:
+// Aggregates discovered files into batches of a specific size before
+// triggering processing. This is optimized for high-volume scenarios
+// where individual file processing would be inefficient.
+//
+// Data Flow:
+// 1. Monitoring: Combines initial directory scan with real-time fsnotify events.
+// 2. Collection: Stores unique file paths in an internal map.
+// 3. Threshold Check: Triggers a flush when the map size reaches the configured limit.
+// 4. Timeout Fallback: Ensures no files are stranded by flushing after a period of inactivity.
 package poller
 
 import (
 	"context"
-	"fmt"
 	"sync"
 	"time"
 
@@ -14,31 +25,43 @@ import (
 // is reached before executing actions. It uses file system notifications for low-latency detection
 // and a timeout fallback to ensure files are not stranded.
 type BatchPoller struct {
-	cfg   *config.Config
-	utils OSUtils
-	mu    sync.Mutex
-	files map[string]struct{}
+	cfg        *config.Config
+	utils      OSUtils
+	mu         sync.Mutex
+	files      map[string]struct{}
+	newWatcher func() (Watcher, error)
 }
 
+// NewBatchPoller initializes a new BatchPoller with native OS utilities.
 func NewBatchPoller(cfg *config.Config) *BatchPoller {
 	return &BatchPoller{
 		cfg:   cfg,
 		utils: NewOSUtils(),
 		files: make(map[string]struct{}),
+		newWatcher: func() (Watcher, error) {
+			return newRealWatcher()
+		},
 	}
 }
 
+// Start begins the batch polling process.
+//
+// Data Flow:
+// 1. Initial Scan: Populate internal list with current files.
+// 2. Event Watcher: Background goroutine listens for new file creations.
+// 3. Batch Logic: If file count >= threshold, call flush().
+// 4. Fallback: If BatchTimeoutSeconds passes without reaching threshold, call flush().
 func (p *BatchPoller) Start(ctx context.Context, results chan<- []string) error {
-	watcher, err := fsnotify.NewWatcher()
+	watcher, err := p.newWatcher()
 	if err != nil {
-		return fmt.Errorf("failed to create watcher: %w", err)
+		return &ErrWatcherInitialization{Err: err}
 	}
 	defer func() {
 		_ = watcher.Close()
 	}()
 
 	if err := watcher.Add(p.cfg.Poll.Directory); err != nil {
-		return fmt.Errorf("failed to add directory to watcher: %w", err)
+		return &ErrWatcherInitialization{Err: err}
 	}
 
 	// Initial scan
@@ -68,7 +91,7 @@ func (p *BatchPoller) Start(ctx context.Context, results chan<- []string) error 
 				p.flush(results)
 			}
 			p.mu.Unlock()
-		case event, ok := <-watcher.Events:
+		case event, ok := <-watcher.Events():
 			if !ok {
 				return nil
 			}
@@ -78,7 +101,7 @@ func (p *BatchPoller) Start(ctx context.Context, results chan<- []string) error 
 				stat, err := p.utils.Stat(event.Name)
 				if err == nil && stat.IsDir() {
 					p.mu.Unlock()
-					return fmt.Errorf("subfolder detected: %s", event.Name)
+					return &ErrSubfolderDetected{Path: event.Name}
 				}
 				p.files[event.Name] = struct{}{}
 				if p.checkThreshold(results) {
@@ -86,11 +109,11 @@ func (p *BatchPoller) Start(ctx context.Context, results chan<- []string) error 
 				}
 				p.mu.Unlock()
 			}
-		case err, ok := <-watcher.Errors:
+		case err, ok := <-watcher.Errors():
 			if !ok {
 				return nil
 			}
-			return fmt.Errorf("watcher error: %w", err)
+			return &ErrWatcherRuntime{Err: err}
 		}
 	}
 }
@@ -110,10 +133,21 @@ func (p *BatchPoller) checkThreshold(results chan<- []string) bool {
 
 // flush sends all currently collected files as a single batch and clears the internal map.
 func (p *BatchPoller) flush(results chan<- []string) {
+	if len(p.files) == 0 {
+		return
+	}
 	batch := make([]string, 0, len(p.files))
 	for f := range p.files {
 		batch = append(batch, f)
 	}
-	results <- batch
+	// Security: Dispatch in a goroutine to prevent blocking the poller loop
+	// when the results channel consumer is slow.
+	go func(b []string) {
+		select {
+		case results <- b:
+		case <-time.After(10 * time.Second):
+			// Log or handle timeout if the engine is completely stuck
+		}
+	}(batch)
 	p.files = make(map[string]struct{})
 }

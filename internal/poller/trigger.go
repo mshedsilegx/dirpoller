@@ -1,3 +1,15 @@
+// Package poller (Trigger) implements the signal-file detection strategy.
+//
+// Objective:
+// Coordinate file processing based on the appearance of a specific "trigger"
+// or "signal" file. This allows upstream systems to signal that a set of
+// files is ready for processing.
+//
+// Data Flow:
+// 1. Collection: Monitors the directory for any new file arrivals.
+// 2. Pattern Matching: Checks every new file against the configured trigger pattern.
+// 3. Trigger Detection: If the trigger file appears, all currently pending files are flushed.
+// 4. Timeout Fallback: Forces a flush if the trigger never arrives within the timeout period.
 package poller
 
 import (
@@ -16,36 +28,52 @@ import (
 // Once detected, it processes all other files currently pending in the directory.
 // It also includes a timeout fallback to process files if the trigger never arrives.
 type TriggerPoller struct {
-	cfg   *config.Config
-	utils OSUtils
-	mu    sync.Mutex
-	files map[string]struct{}
+	cfg        *config.Config
+	utils      OSUtils
+	mu         sync.Mutex
+	files      map[string]struct{}
+	newWatcher func() (Watcher, error)
 }
 
+// NewTriggerPoller initializes a new TriggerPoller with pattern-based detection.
 func NewTriggerPoller(cfg *config.Config) *TriggerPoller {
 	return &TriggerPoller{
 		cfg:   cfg,
 		utils: NewOSUtils(),
 		files: make(map[string]struct{}),
+		newWatcher: func() (Watcher, error) {
+			return newRealWatcher()
+		},
 	}
 }
 
+// Start begins the trigger polling process.
+//
+// Objective: Process files only when a specific "ready" or "done" file pattern appears.
+//
+// Data Flow:
+// 1. Initial Scan: Uses OSUtils to find existing files and checks for illegal subfolders.
+// 2. Watcher: Initializes fsnotify to monitor for new (Create) or modified (Write) files.
+// 3. Pattern Match: If a new file matches the trigger pattern (e.g., "ready.ok" or "*.done"), flush() is called.
+// 4. Collection: Non-trigger files are stored in an internal map to ensure uniqueness.
+// 5. Timeout Fallback: A ticker (cfg.Poll.BatchTimeoutSeconds) forces a flush if the trigger never arrives.
+// 6. Flush: All collected file paths (excluding the trigger) are sent to the results channel.
 func (p *TriggerPoller) Start(ctx context.Context, results chan<- []string) error {
 	pattern, ok := p.cfg.Poll.Value.(string)
 	if !ok {
-		return fmt.Errorf("trigger pattern must be a string")
+		return &ErrWatcherInitialization{Err: fmt.Errorf("trigger pattern must be a string")}
 	}
 
-	watcher, err := fsnotify.NewWatcher()
+	watcher, err := p.newWatcher()
 	if err != nil {
-		return fmt.Errorf("failed to create watcher: %w", err)
+		return &ErrWatcherInitialization{Err: err}
 	}
 	defer func() {
 		_ = watcher.Close()
 	}()
 
 	if err := watcher.Add(p.cfg.Poll.Directory); err != nil {
-		return fmt.Errorf("failed to add directory to watcher: %w", err)
+		return &ErrWatcherInitialization{Err: err}
 	}
 
 	// Initial scan
@@ -79,7 +107,7 @@ func (p *TriggerPoller) Start(ctx context.Context, results chan<- []string) erro
 				p.flush(results)
 			}
 			p.mu.Unlock()
-		case event, ok := <-watcher.Events:
+		case event, ok := <-watcher.Events():
 			if !ok {
 				return nil
 			}
@@ -97,11 +125,11 @@ func (p *TriggerPoller) Start(ctx context.Context, results chan<- []string) erro
 				}
 				p.mu.Unlock()
 			}
-		case err, ok := <-watcher.Errors:
+		case err, ok := <-watcher.Errors():
 			if !ok {
 				return nil
 			}
-			return fmt.Errorf("watcher error: %w", err)
+			return &ErrWatcherRuntime{Err: err}
 		}
 	}
 }
@@ -124,6 +152,14 @@ func (p *TriggerPoller) flush(results chan<- []string) {
 	for f := range p.files {
 		batch = append(batch, f)
 	}
-	results <- batch
+	// Security: Dispatch in a goroutine to prevent blocking the poller loop
+	// when the results channel consumer is slow.
+	go func(b []string) {
+		select {
+		case results <- b:
+		case <-time.After(10 * time.Second):
+			// Log or handle timeout if the engine is completely stuck
+		}
+	}(batch)
 	p.files = make(map[string]struct{})
 }

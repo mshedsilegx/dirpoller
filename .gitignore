@@ -1,7 +1,9 @@
 # Binaries
+*.bin
 *.exe
 *.exe~
 *.dll
+*.lib
 *.so
 *.dylib
 /bin/
@@ -21,3 +23,36 @@ Thumbs.db
 
 # Go
 vendor/
+
+# Secrets and environment
+.env
+*.key
+*.env
+*.crt
+*.pem
+*.p12
+*.gpg
+*.secret
+secrets/
+
+# Transient
+*.out
+*.tmp
+*.test
+*.log
+tmp/
+out/
+log/
+
+# Data
+*.db
+
+# Backup files (sequences)
+*.bk??
+
+# Build files
+.windsurf
+RULES.md
+GEMINI.md
+CLAUDE.md
+JULES.md

@@ -1,6 +1,19 @@
+// Package service_test provides unit tests for the CustomLogger.
+//
+// Objective:
+// Validate the dual-track file-based logging system, ensuring that process
+// events and per-execution activity reports are correctly formatted,
+// persisted, and automatically purged based on retention policies.
+//
+// Scenarios Covered:
+// - Activity Logging: Verification of JSON-like summary and file list formatting.
+// - Process Logging: Verification of daily process log creation and appending.
+// - Retention: Confirms that logs older than N days are correctly identified and deleted.
+// - Error Handling: Graceful behavior when log directories are inaccessible.
 package service
 
 import (
+	"criticalsys.net/dirpoller/internal/testutils"
 	"os"
 	"path/filepath"
 	"strings"
@@ -8,16 +21,19 @@ import (
 	"time"
 )
 
+// TestCustomLogger_LogExecution verifies the formatting and creation of per-cycle activity logs.
+//
+// Scenario:
+// 1. Initialize CustomLogger with a temporary test directory.
+// 2. Log an execution summary containing both processed and failed files.
+// 3. Inspect the resulting activity log file content.
+//
+// Success Criteria:
+// - File must be named with the correct "activity" prefix and timestamp.
+// - Content must include all metadata (path, size, hash) for each file.
+// - Sections (# Status, # List of files...) must be correctly delimited.
 func TestCustomLogger_LogExecution(t *testing.T) {
-	tempDir := os.Getenv("TEMP")
-	if tempDir == "" {
-		tempDir = os.TempDir()
-	}
-	testDir := filepath.Join(tempDir, "dirpoller_UTESTS", "logger_exec")
-	_ = os.MkdirAll(testDir, 0750)
-	defer func() {
-		_ = os.RemoveAll(testDir)
-	}()
+	testDir := testutils.GetUniqueTestDir("service", "logger_exec")
 
 	logName := filepath.Join(testDir, "test.log")
 	logger := NewCustomLogger(logName, 0)
@@ -25,10 +41,10 @@ func TestCustomLogger_LogExecution(t *testing.T) {
 	summary := ExecutionSummary{
 		StartTime: time.Now(),
 		Processed: []FileProcessInfo{
-			{Path: "file1.txt", Size: 100, Hash: "hash1"},
+			{Path: "file1.txt", Size: 100, Hash: "a1b2c3d4e5f6g7h8a1b2c3d4e5f6g7h8"},
 		},
 		Errors: []FileProcessInfo{
-			{Path: "file2.txt", Size: 200, Hash: "hash2", Error: "some error"},
+			{Path: "file2.txt", Size: 200, Hash: "b2c3d4e5f6g7h8i9b2c3d4e5f6g7h8i9", Error: "some error"},
 		},
 	}
 
@@ -47,10 +63,10 @@ func TestCustomLogger_LogExecution(t *testing.T) {
 			if !strings.Contains(sContent, "# Status") {
 				t.Errorf("log missing # Status section")
 			}
-			if !strings.Contains(sContent, "file1.txt|100|hash1") {
+			if !strings.Contains(sContent, "file1.txt|100|a1b2c3d4e5f6g7h8a1b2c3d4e5f6g7h8") {
 				t.Errorf("log missing processed file info")
 			}
-			if !strings.Contains(sContent, "file2.txt in error|200|hash2|some error") {
+			if !strings.Contains(sContent, "file2.txt in error|200|b2c3d4e5f6g7h8i9b2c3d4e5f6g7h8i9|some error") {
 				t.Errorf("log missing error file info or incorrect format")
 			}
 		}
@@ -61,15 +77,7 @@ func TestCustomLogger_LogExecution(t *testing.T) {
 }
 
 func TestCustomLogger_LogProcess(t *testing.T) {
-	tempDir := os.Getenv("TEMP")
-	if tempDir == "" {
-		tempDir = os.TempDir()
-	}
-	testDir := filepath.Join(tempDir, "dirpoller_UTESTS", "logger_process")
-	_ = os.MkdirAll(testDir, 0750)
-	defer func() {
-		_ = os.RemoveAll(testDir)
-	}()
+	testDir := testutils.GetUniqueTestDir("service", "logger_process")
 
 	logName := filepath.Join(testDir, "test.log")
 	logger := NewCustomLogger(logName, 0)
@@ -96,16 +104,40 @@ func TestCustomLogger_LogProcess(t *testing.T) {
 	}
 }
 
-func TestCustomLogger_PurgeOldLogs(t *testing.T) {
-	tempDir := os.Getenv("TEMP")
-	if tempDir == "" {
-		tempDir = os.TempDir()
+func TestCustomLogger_PurgeOldLogs_ReadDirError(t *testing.T) {
+	// Use a directory that doesn't exist to trigger ReadDir error
+	logger := NewCustomLogger("Z:\\non_existent_dir_123\\test.log", 1)
+	// Manually set lastPurgeDate to force purgeOldLogs execution
+	logger.lastPurgeDate = "20000101"
+
+	// This calls checkAndPurge -> purgeOldLogs
+	// LogProcess will fail to open the file, but we want to ensure purgeOldLogs returns gracefully
+	_ = logger.LogProcess("test")
+}
+
+func TestCustomLogger_PurgeOldLogs_SkipDir(t *testing.T) {
+	testDir := testutils.GetUniqueTestDir("service", "logger_purge_skipdir")
+
+	logName := filepath.Join(testDir, "test.log")
+	logger := NewCustomLogger(logName, 1)
+	logger.lastPurgeDate = "20000101"
+
+	// Create a sub-directory that matches the prefix to cover the entry.IsDir() skip
+	subDir := filepath.Join(testDir, "test_process_20200101.log")
+	_ = os.MkdirAll(subDir, 0750)
+
+	if err := logger.LogProcess("Triggering purge"); err != nil {
+		t.Fatalf("LogProcess failed: %v", err)
 	}
-	testDir := filepath.Join(tempDir, "dirpoller_UTESTS", "logger_purge")
-	_ = os.MkdirAll(testDir, 0750)
-	defer func() {
-		_ = os.RemoveAll(testDir)
-	}()
+
+	// subDir should still exist
+	if _, err := os.Stat(subDir); err != nil {
+		t.Errorf("expected subDir to still exist, got %v", err)
+	}
+}
+
+func TestCustomLogger_PurgeOldLogs(t *testing.T) {
+	testDir := testutils.GetUniqueTestDir("service", "logger_purge")
 
 	logName := filepath.Join(testDir, "test.log")
 	logger := NewCustomLogger(logName, 2) // 2 days retention

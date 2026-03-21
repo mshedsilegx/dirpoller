@@ -1,0 +1,35 @@
+[Unit]
+Description=DirPoller - High Performance SFTP Upload Engine
+After=local-fs.target network-online.target sys-fs-fuse-connections.mount remote-fs.target
+Before=shutdown.target
+StartLimitIntervalSec=500
+StartLimitBurst=5
+
+[Service]
+# Type=simple is standard for Go applications that run in the foreground.
+# If daemonization logic is added later, this can be changed to forking.
+Type=simple
+User=dirpoller
+Group=users
+
+# Ensure the user has a home directory context for default key path resolution (~/.secretprotector.key)
+Environment=HOME=/home/dirpoller
+
+# Start command: points to the binary and the configuration file.
+ExecStart=/usr/local/bin/dirpoller -config /etc/dirpoller/config.json
+
+# No explicit ExecStop is needed for Type=simple as systemd sends SIGTERM automatically.
+# The application handles SIGTERM for a graceful shutdown.
+
+# SIGTERM to the main process, followed by SIGKILL to the entire control group.
+KillMode=mixed
+
+# Graceful restart on unexpected failure
+Restart=on-failure
+RestartSec=30s
+
+# Ensures graceful dependencies cleanup if the service fails
+TimeoutStopSec=20s
+
+[Install]
+WantedBy=multi-user.target

@@ -1,19 +1,39 @@
+// Package poller_test provides functional and scenario-based tests for the polling engine.
+//
+// Objective:
+// Validate the robust detection of files under various operational strategies
+// (Interval, Batch, Event, Trigger) while ensuring strict adherence to
+// non-recursive directory constraints.
+//
+// Scenarios Covered:
+// - Interval Polling: Basic time-based discovery.
+// - Batch Polling: Threshold-based and timeout-based flushing.
+// - Event Polling: Real-time discovery via OS-native file system events.
+// - Security: Dynamic subfolder detection and rejection of nested structures.
 package poller
 
 import (
 	"context"
 	"criticalsys.net/dirpoller/internal/config"
+	"criticalsys.net/dirpoller/internal/testutils"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 )
 
+// TestIntervalPoller verifies basic time-based file discovery.
+//
+// Scenario:
+// 1. Initialize IntervalPoller with a 1-second interval.
+// 2. Create a test file in the monitored directory.
+// 3. Start the poller and wait for the file to be emitted.
+//
+// Success Criteria:
+// The poller must detect the file and send its path to the results channel
+// within the configured interval.
 func TestIntervalPoller(t *testing.T) {
-	testDir, err := GetTestDir("IntervalPoller")
-	if err != nil {
-		t.Fatalf("failed to create test dir: %v", err)
-	}
+	testDir := testutils.GetUniqueTestDir("poller", "IntervalPoller")
 
 	cfg := &config.Config{
 		Poll: config.PollConfig{
@@ -47,11 +67,18 @@ func TestIntervalPoller(t *testing.T) {
 	}
 }
 
+// TestBatchPoller verifies threshold-based and timeout-based batching.
+//
+// Scenario:
+// 1. Initialize BatchPoller with a threshold of 2 files and a 2-second timeout.
+// 2. Add 2 files to trigger an immediate threshold-based flush.
+// 3. Add 1 file and wait for the timeout-based flush.
+//
+// Success Criteria:
+// - First batch is emitted as soon as the 2nd file is detected.
+// - Second batch is emitted only after the timeout occurs.
 func TestBatchPoller(t *testing.T) {
-	testDir, err := GetTestDir("BatchPoller")
-	if err != nil {
-		t.Fatalf("failed to create test dir: %v", err)
-	}
+	testDir := testutils.GetUniqueTestDir("poller", "BatchPoller")
 
 	cfg := &config.Config{
 		Poll: config.PollConfig{
@@ -109,7 +136,7 @@ func TestBatchPoller(t *testing.T) {
 }
 
 func TestBatchPollerTimeout(t *testing.T) {
-	testDir, _ := GetTestDir("BatchPollerTimeout")
+	testDir := testutils.GetUniqueTestDir("poller", "BatchPollerTimeout")
 	testFile := filepath.Join(testDir, "test.txt")
 	_ = os.WriteFile(testFile, []byte("data"), 0644)
 
@@ -141,11 +168,16 @@ func TestBatchPollerTimeout(t *testing.T) {
 	}
 }
 
+// TestEventPoller verifies real-time discovery via OS events.
+//
+// Scenario:
+// 1. Initialize EventPoller and start its watcher.
+// 2. Create a file after the watcher is active.
+//
+// Success Criteria:
+// The poller must receive the FS event and immediately emit the file path.
 func TestEventPoller(t *testing.T) {
-	testDir, err := GetTestDir("EventPoller")
-	if err != nil {
-		t.Fatalf("failed to create test dir: %v", err)
-	}
+	testDir := testutils.GetUniqueTestDir("poller", "EventPoller")
 
 	cfg := &config.Config{
 		Poll: config.PollConfig{
@@ -181,11 +213,17 @@ func TestEventPoller(t *testing.T) {
 	}
 }
 
+// TestEventPollerDynamicSubfolder verifies the non-recursive safety constraint at runtime.
+//
+// Scenario:
+// 1. Start EventPoller on an empty directory.
+// 2. Create a subfolder while the poller is running.
+//
+// Success Criteria:
+// The poller must detect the subfolder creation and return a fatal
+// ErrSubfolderDetected to stop processing.
 func TestEventPollerDynamicSubfolder(t *testing.T) {
-	testDir, err := GetTestDir("EventPollerDynamic")
-	if err != nil {
-		t.Fatalf("failed to create test dir: %v", err)
-	}
+	testDir := testutils.GetUniqueTestDir("poller", "EventPollerDynamic")
 
 	cfg := &config.Config{
 		Poll: config.PollConfig{
@@ -223,10 +261,7 @@ func TestEventPollerDynamicSubfolder(t *testing.T) {
 }
 
 func TestPollerSubfolderDetection(t *testing.T) {
-	testDir, err := GetTestDir("SubfolderDetection")
-	if err != nil {
-		t.Fatalf("failed to create test dir: %v", err)
-	}
+	testDir := testutils.GetUniqueTestDir("poller", "SubfolderDetection")
 
 	// Create subfolder
 	subDir := filepath.Join(testDir, "sub")

@@ -1,3 +1,17 @@
+//go:build windows
+
+// Package service (Windows) provides Windows-specific service lifecycle management.
+//
+// Objective:
+// Implement the svc.Handler interface to allow DirPoller to run as a native
+// Windows Service. It handles service control signals (Start, Stop, Pause, Continue)
+// and reports status back to the Service Control Manager (SCM).
+//
+// Data Flow:
+// 1. RunService: Entry point from main_windows.go to start the service loop.
+// 2. Execute: Main control loop for receiving and responding to SCM signals.
+// 3. Engine Integration: Manages the lifecycle of the core Engine within the service context.
+// 4. Installation: Automates service registration and EventLog source creation.
 package service
 
 import (
@@ -15,15 +29,29 @@ import (
 	"golang.org/x/sys/windows/svc/mgr"
 )
 
+// WindowsService implements the svc.Handler interface for Windows Service integration.
+//
+// Objective: Allow DirPoller to run as a native Windows Service with full
+// lifecycle support (Start, Stop, Pause, Continue).
+//
+// Data Flow:
+// 1. cfgPath: Stores the absolute path to the configuration file for Engine initialization.
 type WindowsService struct {
 	cfgPath string
 }
 
+// Execute is the entry point for Windows Service control events.
+//
+// Data Flow:
+// 1. Service Start: Initializes the Engine and starts it in a background goroutine.
+// 2. Control Loop: Listens for OS control requests (Stop, Pause, Continue).
+// 3. Status Reporting: Communicates service state changes back to the Windows Service Manager (SCM).
+// 4. Graceful Shutdown: Signals the Engine context to cancel when Stop/Shutdown is received.
 func (m *WindowsService) Execute(args []string, r <-chan svc.ChangeRequest, changes chan<- svc.Status) (ssec bool, errno uint32) {
 	const cmdsAccepted = svc.AcceptStop | svc.AcceptShutdown | svc.AcceptPauseAndContinue
 	changes <- svc.Status{State: svc.StartPending}
 
-	cfg, err := config.LoadConfig(m.cfgPath)
+	cfg, _, err := config.LoadConfig(m.cfgPath)
 	if err != nil {
 		return false, 1
 	}
@@ -62,11 +90,11 @@ loop:
 			case svc.Continue:
 				changes <- svc.Status{State: svc.Running, Accepts: cmdsAccepted}
 			default:
-				engine.logError(fmt.Sprintf("Unexpected control request #%d", c))
+				engine.logError(fmt.Sprintf("[Service:Execute] Unexpected control request #%d", c))
 			}
 		case err := <-errChan:
 			if err != nil && err != context.Canceled {
-				engine.logError(fmt.Sprintf("Engine stopped with error: %v", err))
+				engine.logError(fmt.Sprintf("[Service:Execute] Engine stopped with error: %v", err))
 				errno = 3 // custom exit code for engine failure
 			}
 			break loop
@@ -76,6 +104,15 @@ loop:
 	return
 }
 
+// RunService starts the Windows Service execution loop.
+//
+// Objective: Act as the bridge between the Windows Service Control Manager (SCM)
+// and the DirPoller engine.
+//
+// Data Flow:
+// 1. Mode Selection: Runs in either debug mode or standard service mode.
+// 2. Event Routing: Forwards SCM control signals to the WindowsService handler.
+// 3. Error Recovery: Logs fatal service startup failures to the Windows Event Log.
 func RunService(name string, cfgPath string, isDebug bool) {
 	var err error
 	if isDebug {
@@ -170,6 +207,15 @@ var (
 )
 
 // InstallService installs the application as a Windows service.
+//
+// Objective: Automate the registration of DirPoller with the Windows Service Control Manager (SCM)
+// and initialize the Application Event Log source.
+//
+// Data Flow:
+// 1. Path Resolution: Gets the absolute path to the current executable.
+// 2. SCM Connection: Establishes a session with the Windows Service Manager.
+// 3. Service Creation: Registers the service name, binary path, and startup arguments.
+// 4. EventLog Registration: Creates the "DirPoller" source in the Windows Application Log.
 func InstallService(name, display, cfgPath, user, pass string) error {
 	exepath, err := os.Executable()
 	if err != nil {
@@ -215,6 +261,14 @@ func InstallService(name, display, cfgPath, user, pass string) error {
 }
 
 // RemoveService removes the application from Windows services.
+//
+// Objective: Completely deregister the service and its associated event log source.
+//
+// Data Flow:
+// 1. Connection: Establishes a session with the Windows Service Manager.
+// 2. Stop Signal: Attempts to gracefully stop the service if it is currently running.
+// 3. Deletion: Removes the service registration from the SCM.
+// 4. Cleanup: Unregisters the EventLog source from the registry.
 func RemoveService(name string) error {
 	m, err := defaultManager.Connect()
 	if err != nil {

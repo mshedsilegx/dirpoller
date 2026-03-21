@@ -1,3 +1,17 @@
+// Package action contains logic for processing files via SFTP or local scripts.
+// It provides a standardized ActionHandler interface to execute operations
+// on batches of verified files in parallel.
+//
+// Core Components:
+// - ActionHandler: Interface for executing operations on file batches.
+// - SFTPHandler: High-performance SFTP upload engine with connection pooling and atomic protocols.
+// - ScriptHandler: Local script execution engine with timeout and concurrency control.
+//
+// Data Flow:
+// 1. The Engine provides a list of verified file paths to the ActionHandler.
+// 2. The handler (SFTP or Script) executes the action in parallel using a semaphore-controlled worker pool.
+// 3. For SFTP, an Atomic Upload Protocol (Stage -> Transfer -> Rename -> Stat) is enforced.
+// 4. Returns a list of successfully processed files for post-processing (archiving).
 package action
 
 import (
@@ -13,7 +27,14 @@ import (
 )
 
 // ScriptHandler executes local scripts for processed files.
-// It uses a semaphore pool to control concurrency and enforces an execution timeout.
+//
+// Objective: Extend application functionality by delegating file processing
+// to external logic (scripts or binaries).
+//
+// Core Functionality:
+// - Parallel Execution: Uses a semaphore pool to control concurrency.
+// - Reliability: Enforces execution timeouts and captures all output.
+// - Security: Validates absolute paths and handles execution contexts.
 type ScriptHandler struct {
 	cfg       *config.Config
 	semaphore chan struct{}
@@ -21,13 +42,26 @@ type ScriptHandler struct {
 
 // NewScriptHandler creates a new script action handler with a persistent semaphore.
 func NewScriptHandler(cfg *config.Config) *ScriptHandler {
+	conns := cfg.Action.ConcurrentConnections
+	if conns <= 0 {
+		conns = 1
+	}
 	return &ScriptHandler{
 		cfg:       cfg,
-		semaphore: make(chan struct{}, cfg.Action.ConcurrentConnections),
+		semaphore: make(chan struct{}, conns),
 	}
 }
 
-// Execute runs the configured script for each file in parallel.
+// Execute runs the configured script for each file in parallel using a handler-wide semaphore pool.
+//
+// Objective: Extend application functionality by delegating file processing
+// to external logic (scripts or binaries).
+//
+// Data Flow:
+// 1. Worker Pool: Uses a semaphore pool to throttle parallel script execution.
+// 2. Child Context: Wraps each execution in a child context with a maximum timeout.
+// 3. Script Invocation: Executes the external command with the absolute file path.
+// 4. Result Aggregation: Collects exit codes and captures combined output for reporting.
 func (h *ScriptHandler) Execute(ctx context.Context, files []string) ([]string, error) {
 	var wg sync.WaitGroup
 	errChan := make(chan error, len(files))
@@ -76,13 +110,18 @@ func (h *ScriptHandler) Close() error {
 	return nil
 }
 
+// RemoteCleanup implements the ActionHandler interface.
+func (h *ScriptHandler) RemoteCleanup(ctx context.Context) error {
+	return nil
+}
+
 // executeScript runs the configured script for a single file.
 // It uses an absolute path for security and a context timeout for reliability.
 func (h *ScriptHandler) executeScript(ctx context.Context, file string) error {
 	// Security: Use absolute path and validate file exists
 	absFile, err := filepath.Abs(file)
 	if err != nil {
-		return fmt.Errorf("failed to get absolute path for %s: %w", file, err)
+		return fmt.Errorf("[Action:Script] failed to get absolute path for %s: %w", file, err)
 	}
 
 	timeout := time.Duration(h.cfg.Action.Script.TimeoutSeconds) * time.Second
@@ -100,7 +139,7 @@ func (h *ScriptHandler) executeScript(ctx context.Context, file string) error {
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("script execution failed for %s: %w, output: %s", file, err, string(output))
+		return &ErrExecutionFailed{Path: file, Err: err, Output: string(output)}
 	}
 
 	return nil

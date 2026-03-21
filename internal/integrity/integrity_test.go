@@ -1,38 +1,49 @@
+// Package integrity_test provides unit tests for the integrity verification logic.
+//
+// Objective:
+// Validate the robust verification of file stability before processing.
+// It ensures that files are fully committed to disk and not currently held
+// by other processes, using various algorithms (Size, Timestamp, Hash).
+//
+// Scenarios Covered:
+//   - Lock Detection: Verifies rejection of files currently locked by the OS.
+//   - Stability Sampling: Confirms that files are rejected if properties change
+//     during the verification interval.
+//   - Multi-Algorithm: Validates Size, Timestamp, and XXH3-128 Hash strategies.
+//   - Edge Cases: Handles non-existent files, permission errors, and context cancellation.
 package integrity
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"criticalsys.net/dirpoller/internal/config"
+	"criticalsys.net/dirpoller/internal/testutils"
 )
 
-var testBaseDir string
-
 func TestMain(m *testing.M) {
-	tempDir := os.Getenv("TEMP")
-	if tempDir == "" {
-		tempDir = os.TempDir()
-	}
-	testBaseDir = filepath.Join(tempDir, "dirpoller_UTESTS", "integrity")
-	_ = os.MkdirAll(testBaseDir, 0750)
-
 	code := m.Run()
-
-	// os.RemoveAll(testBaseDir) // Removed to avoid race conditions
 	os.Exit(code)
 }
 
 func getTestDir(name string) string {
-	dir := filepath.Join(testBaseDir, name)
-	_ = os.RemoveAll(dir)
-	_ = os.MkdirAll(dir, 0750)
-	return dir
+	return testutils.GetUniqueTestDir("integrity", name)
 }
 
+// TestIntegrityLockCheck verifies that locked files are correctly identified.
+//
+// Scenario:
+// 1. Create a test file.
+// 2. Mock OSUtils to report the file as locked.
+// 3. Attempt verification via Verifier.Verify.
+//
+// Success Criteria:
+// - Verification must return false (not verified) when the file is locked.
+// - No error should be returned for a valid lock detection scenario.
 func TestIntegrityLockCheck(t *testing.T) {
 	testDir := getTestDir("LockCheck")
 	testFile := filepath.Join(testDir, "locked.txt")
@@ -85,6 +96,16 @@ func TestIntegrityHash(t *testing.T) {
 	}
 }
 
+// TestIntegrityChangingFile verifies that unstable files are rejected.
+//
+// Scenario:
+// 1. Create a test file.
+// 2. Start verification in a goroutine.
+// 3. Modify the file size during the verification interval.
+//
+// Success Criteria:
+// - Verifier must detect the property change between samples.
+// - Verification must return false to indicate the file is still "active".
 func TestIntegrityChangingFile(t *testing.T) {
 	testDir := getTestDir("ChangingFile")
 	testFile := filepath.Join(testDir, "changing.txt")
@@ -153,18 +174,148 @@ func TestVerifierUnsupportedAlgorithm(t *testing.T) {
 	}
 }
 
-func TestVerifierCalculateHashError(t *testing.T) {
-	testDir := getTestDir("HashError")
+func TestVerifierCalculateHash(t *testing.T) {
+	testDir := getTestDir("CalculateHash")
+	testFile := filepath.Join(testDir, "test.txt")
+	content := []byte("hello world")
+	_ = os.WriteFile(testFile, content, 0644)
+
+	cfg := &config.Config{}
+	v := NewVerifier(cfg)
+	hash, err := v.CalculateHash(testFile)
+	if err != nil {
+		t.Fatalf("CalculateHash failed: %v", err)
+	}
+	if len(hash) != 32 {
+		t.Errorf("expected 32-character hex string for XXH3-128, got %d characters: %s", len(hash), hash)
+	}
+}
+
+func TestVerifierCalculateHashReadError(t *testing.T) {
+	testDir := getTestDir("HashReadError")
+	// On Windows, opening a directory with os.Open succeeds, but io.Copy/Read will fail.
+	cfg := &config.Config{}
+	v := NewVerifier(cfg)
+
+	_, err := v.CalculateHash(testDir)
+	if err == nil {
+		t.Error("expected error when hashing a directory (read failure), got nil")
+	}
+}
+
+func TestVerifierVerifyContextCancelled(t *testing.T) {
+	testDir := getTestDir("VerifyContext")
+	testFile := filepath.Join(testDir, "test.txt")
+	_ = os.WriteFile(testFile, []byte("data"), 0644)
+
 	cfg := &config.Config{
 		Integrity: config.IntegrityConfig{
-			Algorithm: config.IntegrityHash,
+			VerificationAttempts: 2,
+			VerificationInterval: 1,
+			Algorithm:            config.IntegritySize,
 		},
 	}
 	v := NewVerifier(cfg)
 
-	// Passing a directory to calculateHash should fail
-	_, err := v.calculateHash(testDir)
-	if err == nil {
-		t.Error("expected error calculating hash of a directory, got nil")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := v.Verify(ctx, testFile)
+	if err != context.Canceled {
+		t.Errorf("expected context.Canceled, got %v", err)
 	}
 }
+
+func TestVerifierVerifyFirstStatError(t *testing.T) {
+	cfg := &config.Config{
+		Integrity: config.IntegrityConfig{
+			VerificationAttempts: 1,
+			VerificationInterval: 1,
+			Algorithm:            config.IntegritySize,
+		},
+	}
+	v := NewVerifier(cfg)
+
+	v.utils = &testutils.MockOSUtils{Locked: false}
+
+	// Pass a non-existent file to trigger Stat error in getIntegrityValue
+	_, err := v.Verify(context.Background(), "non_existent_file_12345")
+	if err == nil {
+		t.Error("expected error for non-existent file during first integrity check, got nil")
+	}
+}
+
+func TestVerifierVerifySecondStatError(t *testing.T) {
+	testDir := getTestDir("VerifySecondStatError")
+	testFile := filepath.Join(testDir, "test.txt")
+	_ = os.WriteFile(testFile, []byte("data"), 0644)
+
+	cfg := &config.Config{
+		Integrity: config.IntegrityConfig{
+			VerificationAttempts: 1,
+			VerificationInterval: 1,
+			Algorithm:            config.IntegritySize,
+		},
+	}
+	v := NewVerifier(cfg)
+
+	// Start a goroutine to delete the file during the wait
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		_ = os.Remove(testFile)
+	}()
+
+	_, err := v.Verify(context.Background(), testFile)
+	if err == nil {
+		t.Error("expected error for file deletion during verification, got nil")
+	}
+}
+
+func TestVerifierVerifyLockDetected(t *testing.T) {
+	testDir := getTestDir("VerifyLock")
+	testFile := filepath.Join(testDir, "locked.txt")
+	_ = os.WriteFile(testFile, []byte("data"), 0644)
+
+	cfg := &config.Config{
+		Integrity: config.IntegrityConfig{
+			VerificationAttempts: 1,
+			VerificationInterval: 1,
+			Algorithm:            config.IntegritySize,
+		},
+	}
+	v := NewVerifier(cfg)
+
+	v.utils = &testutils.MockOSUtils{Locked: true}
+
+	verified, err := v.Verify(context.Background(), testFile)
+	if err != nil {
+		t.Errorf("expected no error, got %v", err)
+	}
+	if verified {
+		t.Error("expected verified=false when locked")
+	}
+}
+
+func TestVerifierVerifyLockError(t *testing.T) {
+	testDir := getTestDir("VerifyLockError")
+	testFile := filepath.Join(testDir, "error.txt")
+	_ = os.WriteFile(testFile, []byte("data"), 0644)
+
+	cfg := &config.Config{
+		Integrity: config.IntegrityConfig{
+			VerificationAttempts: 1,
+			VerificationInterval: 1,
+			Algorithm:            config.IntegritySize,
+		},
+	}
+	v := NewVerifier(cfg)
+
+	v.utils = &testutils.MockOSUtils{Err: fmt.Errorf("lock check failed")}
+
+	_, err := v.Verify(context.Background(), testFile)
+	if err == nil {
+		t.Error("expected error for lock check failure, got nil")
+	}
+}
+
+// [Removed redundant local mocks: mockOSUtils - now using testutils.MockOSUtils]

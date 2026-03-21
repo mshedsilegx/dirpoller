@@ -1,4 +1,22 @@
-// Package service provides the core engine and Windows Service lifecycle management.
+// Package service provides the core engine, logging facilities, and platform-specific service management.
+//
+// Objective:
+// Acts as the central orchestration layer for DirPoller. It coordinates the
+// high-level data pipeline, manages component lifecycles, and ensures system
+// resilience through error recovery and scheduled maintenance tasks.
+//
+// Core Components:
+// - Engine: The primary orchestrator that manages the main processing loop.
+// - CustomLogger: Provides dual-track (Process/Activity) file-based auditing.
+// - PlatformLogger: Integrates with OS-native logging (EventLog/Syslog).
+// - FileVerifier/PostArchiver: Interfaces for integrity and lifecycle management.
+//
+// Data Flow (The "Main Loop"):
+// 1. Polling: The Engine listens for file batches from the Poller.
+// 2. Verification: Discovered files are verified for stability and locks in parallel.
+// 3. Action: Verified files are processed via the ActionHandler (SFTP/Script).
+// 4. Archiving: Successfully processed files are moved or deleted by the Archiver.
+// 5. Auditing: Detailed execution summaries are recorded by the CustomLogger.
 package service
 
 import (
@@ -6,6 +24,8 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,6 +35,30 @@ import (
 	"criticalsys.net/dirpoller/internal/integrity"
 	"criticalsys.net/dirpoller/internal/poller"
 )
+
+var (
+	// goos is used for platform-specific logic and can be overridden in tests.
+	// [Refinement]: removed runtime.GOOS direct assignment here to rely on platform files where possible.
+	// However, engine.go is shared and needs a default for non-service mode or testing.
+	goos = ""
+)
+
+// FileVerifier defines the interface for ensuring files are fully committed.
+type FileVerifier interface {
+	Verify(ctx context.Context, path string) (bool, error)
+	CalculateHash(path string) (string, error)
+}
+
+// PostArchiver defines the interface for post-processing successfully handled files.
+type PostArchiver interface {
+	Process(ctx context.Context, files []string) error
+}
+
+// ActivityLogger defines the interface for dual-track file-based logging.
+type ActivityLogger interface {
+	LogProcess(msg string) error
+	LogExecution(summary ExecutionSummary) error
+}
 
 // EngineLogger defines the interface for engine-level event logging.
 type EngineLogger interface {
@@ -29,17 +73,47 @@ type EngineLogger interface {
 type Engine struct {
 	cfg       *config.Config       // Application configuration
 	poller    poller.Poller        // The selected polling algorithm (Interval, Batch, Event, or Trigger)
-	verifier  *integrity.Verifier  // Logic for ensuring files are fully committed
+	verifier  FileVerifier         // Logic for ensuring files are fully committed
 	handler   action.ActionHandler // The primary action (SFTP or local Script)
-	archiver  *archive.Archiver    // Post-processing logic (Delete, Move, or Compress)
+	archiver  PostArchiver         // Post-processing logic (Delete, Move, or Compress)
 	isService bool                 // Indicates if running as a native Windows Service
 	logger    EngineLogger         // System event logger (Windows Event Log or Console)
-	customLog *CustomLogger        // File-based dual-track logger (if enabled)
+	customLog ActivityLogger       // File-based dual-track logger (if enabled)
+
+	// testBackoff allows overriding the restart delay for unit tests
+	testBackoff time.Duration
+
+	// Internal factories for testing injection
+	platLoggerFunc func(name string, isService bool) (Logger, error)
+
+	// testLastCleanupDay allows overriding the daily task tracker for unit tests
+	testLastCleanupDay int
+
+	consecutivePollerFailures int // Counter for consecutive poller startup failures
 }
 
 // NewEngine initializes the core processing engine with configured components.
-// It maps configuration directives to specific interface implementations.
+// It maps configuration directives to specific interface implementations and sets up
+// the verification and action pipeline.
+//
+// Data Flow:
+// 1. Secret Resolution: Decrypts SFTP passwords if configured.
+// 2. Poller Selection: Maps the config algorithm to a specific Poller implementation.
+// 3. Action Setup: Initializes the SFTP or Script handler.
+// 4. Logging Setup: Configures system and activity loggers.
+// 5. Cleanup Scheduling: Initiates the appropriate RemoteCleanup strategy (CLI vs Service).
 func NewEngine(cfg *config.Config, isService bool) (*Engine, error) {
+	e := &Engine{
+		cfg:            cfg,
+		isService:      isService,
+		platLoggerFunc: NewPlatformLogger,
+	}
+
+	// 0. Handle Secret Decryption (SFTP Password)
+	// [Refinement]: Removed startup decryption logic.
+	// SFTPHandler.Execute now handles decryption per-batch to ensure
+	// sensitive credentials only exist in memory during active execution.
+
 	// 1. Initialize Polling Algorithm
 	var p poller.Poller
 	switch cfg.Poll.Algorithm {
@@ -54,6 +128,7 @@ func NewEngine(cfg *config.Config, isService bool) (*Engine, error) {
 	default:
 		return nil, fmt.Errorf("unsupported poller algorithm: %s", cfg.Poll.Algorithm)
 	}
+	e.poller = p
 
 	// 2. Initialize Primary Action Handler
 	var handler action.ActionHandler
@@ -65,43 +140,87 @@ func NewEngine(cfg *config.Config, isService bool) (*Engine, error) {
 	default:
 		return nil, fmt.Errorf("unsupported action type: %s", cfg.Action.Type)
 	}
+	e.handler = handler
 
 	// 3. Initialize System Logger (EventLog for Services, CLI for manual runs)
-	var logger EngineLogger
 	if isService {
-		var err error
 		// "DirPoller" is the registered event source name
-		platLogger, err := NewPlatformLogger("DirPoller", true)
+		platLogger, err := e.platLoggerFunc("DirPoller", true)
 		if err != nil {
 			return nil, fmt.Errorf("failed to open platform logger: %w", err)
 		}
-		logger = &engineLoggerWrapper{Logger: platLogger}
+		e.logger = &engineLoggerWrapper{Logger: platLogger}
 	} else {
-		logger = &cliLogger{}
+		e.logger = &cliLogger{}
 	}
 
 	// 4. Initialize Optional File-based Logger
-	var customLog *CustomLogger
 	if len(cfg.Logging) > 0 {
-		customLog = NewCustomLogger(cfg.Logging[0].LogName, cfg.Logging[0].LogRetention)
+		e.customLog = NewCustomLogger(cfg.Logging[0].LogName, cfg.Logging[0].LogRetention)
 	}
 
-	return &Engine{
-		cfg:       cfg,
-		poller:    p,
-		verifier:  integrity.NewVerifier(cfg),
-		handler:   handler,
-		archiver:  archive.NewArchiver(cfg),
-		isService: isService,
-		logger:    logger,
-		customLog: customLog,
-	}, nil
+	e.verifier = integrity.NewVerifier(cfg)
+	e.archiver = archive.NewArchiver(cfg)
+
+	// 5. Run RemoteCleanup (CLI only at startup, Service schedules it daily)
+	if !isService {
+		go func() {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			defer cancel()
+			if err := handler.RemoteCleanup(cleanupCtx); err != nil {
+				e.logError(fmt.Sprintf("SFTP RemoteCleanup failed: %v", err))
+			}
+		}()
+	}
+
+	return e, nil
 }
 
-// Run starts the infinite polling loop. It manages the lifecycle of the poller
-// and coordinates the transition of file batches to the processing pipeline.
+// engineLoggerWrapper wraps a Logger to implement EngineLogger.
+type engineLoggerWrapper struct {
+	Logger
+}
+
+func (w *engineLoggerWrapper) Warn(msg string) {
+	_ = w.Info(2, "Warning: "+msg)
+}
+
+// NewEngineWithPlatLogger initializes the core processing engine with a custom platform logger factory.
+// This is primarily used for testing error paths in platform logger initialization.
+func NewEngineWithPlatLogger(cfg *config.Config, isService bool, platLoggerFunc func(name string, isService bool) (Logger, error)) (*Engine, error) {
+	e, err := NewEngine(cfg, isService)
+	if err != nil {
+		return nil, err
+	}
+	e.platLoggerFunc = platLoggerFunc
+
+	// If it's a service, we need to re-initialize the logger with the custom factory
+	if isService {
+		platLogger, err := e.platLoggerFunc("DirPoller", true)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open platform logger: %w", err)
+		}
+		e.logger = &engineLoggerWrapper{Logger: platLogger}
+	}
+
+	return e, nil
+}
+
+// Run starts the infinite polling and processing loop.
+//
+// Objective:
+// Maintain the continuous operation of the file processing pipeline. It manages
+// the coordination between the asynchronous poller and the synchronous
+// processing stages, while also handling scheduled system maintenance.
+//
+// Data Flow:
+// 1. Poller Loop: Runs in a background goroutine, emitting batches to 'results'.
+// 2. Signal Handling: Monitors for context cancellation or system errors.
+// 3. Maintenance: Checks for day-change to trigger daily cleanup tasks.
+// 4. Batch Processing: Invokes 'processFiles' for every batch received from the poller.
+// 5. Recovery: Implements exponential backoff for poller restarts in service mode.
 func (e *Engine) Run(ctx context.Context) error {
-	e.logProcess("Engine starting...")
+	e.logProcess("[Engine:Startup] Engine starting...")
 	results := make(chan []string)
 	errChan := make(chan error, 1)
 
@@ -112,27 +231,112 @@ func (e *Engine) Run(ctx context.Context) error {
 		}
 	}()
 
+	// Scheduled Tasks (Daily at 00:00:00)
+	var lastCleanupDay = -1
+	if e.isService {
+		lastCleanupDay = time.Now().YearDay()
+	}
+	if e.testLastCleanupDay != 0 {
+		lastCleanupDay = e.testLastCleanupDay
+	}
+
 	for {
+		// Check for daily 00:00:00 tasks in service mode
+		if e.isService {
+			now := time.Now()
+			if now.YearDay() != lastCleanupDay {
+				e.logProcess("[Engine:Schedule] Executing scheduled daily tasks (00:00:00)...")
+				lastCleanupDay = now.YearDay()
+
+				// 1. Remote SFTP Cleanup
+				go func(ctx context.Context) {
+					cleanupCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+					defer cancel()
+					if err := e.handler.RemoteCleanup(cleanupCtx); err != nil {
+						e.logError(fmt.Sprintf("[Engine:Schedule] Scheduled SFTP RemoteCleanup failed: %v", err))
+					}
+				}(ctx)
+			}
+		}
+
 		select {
 		case <-ctx.Done():
 			e.logProcess("Engine stopping (context canceled)...")
 			return ctx.Err()
 		case err := <-errChan:
-			e.logError(fmt.Sprintf("Poller error: %v", err))
-			if e.isService {
+			var errMsg string
+			var isPermanent bool
+
+			// Leverage structured error types for recovery decisions
+			switch e := err.(type) {
+			case *poller.ErrSubfolderDetected:
+				errMsg = fmt.Sprintf("[Engine:Poller] Critical: %v. Polling halted for this directory until resolved.", e)
+				isPermanent = true
+			case *poller.ErrWatcherInitialization:
+				errMsg = fmt.Sprintf("[Engine:Poller] Watcher failed to start: %v", e)
+			case *poller.ErrWatcherRuntime:
+				errMsg = fmt.Sprintf("[Engine:Poller] Watcher encountered runtime error: %v", e)
+			default:
+				errMsg = fmt.Sprintf("[Engine:Poller] Poller error: %v", err)
+			}
+
+			e.logError(errMsg)
+
+			if e.isService && err != context.Canceled && !isPermanent {
 				// SECTION: Service Resilience
 				// As per specs.txt, the service should log errors and continue.
 				// We restart the poller to attempt recovery in the next cycle.
-				e.logProcess("Restarting poller after error...")
-				go func() {
-					if err := e.poller.Start(ctx, results); err != nil {
-						errChan <- err
+				// [Recommendation Impl]: Implement exponential backoff for restarts.
+				e.consecutivePollerFailures++
+
+				backoff := 5 * time.Second
+				// Apply exponential factor with overflow protection and cap
+				for i := 1; i < e.consecutivePollerFailures; i++ {
+					nextBackoff := backoff * 2
+					if nextBackoff > 1*time.Hour || nextBackoff < backoff {
+						backoff = 1 * time.Hour
+						break
 					}
-				}()
+					backoff = nextBackoff
+				}
+
+				if strings.Contains(err.Error(), "permission denied") || strings.Contains(err.Error(), "access is denied") {
+					if backoff < 30*time.Second {
+						backoff = 30 * time.Second
+					}
+				}
+
+				if e.testBackoff > 0 {
+					backoff = e.testBackoff
+				}
+				e.logProcess(fmt.Sprintf("[Engine:Poller] Restarting poller in %v after error (failure #%d)...", backoff, e.consecutivePollerFailures))
+
+				go func(delay time.Duration) {
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(delay):
+						if err := e.poller.Start(ctx, results); err != nil {
+							errChan <- err
+						}
+					}
+				}(backoff)
 				continue
 			}
+
+			if isPermanent {
+				e.logProcess("[Engine:Poller] Engine entering idle state due to permanent poller error.")
+				// We don't return here in service mode to keep the service process alive,
+				// but we stop the poller loop by not 'continue'-ing.
+				// However, the Engine loop is infinite. To truly halt, we might need a signal.
+				// For now, we'll just stop restarting the poller.
+				continue
+			}
+
 			return err
 		case files := <-results:
+			// Reset failures on successful result receipt
+			e.consecutivePollerFailures = 0
 			// Pipeline step: Hand off discovered files for verification and execution
 			e.processFiles(ctx, files)
 		}
@@ -140,6 +344,14 @@ func (e *Engine) Run(ctx context.Context) error {
 }
 
 // processFiles coordinates the concurrent verification and sequential execution of a file batch.
+//
+// Objective: Transition a batch of discovered files through the integrity and action pipeline.
+//
+// Pipeline Steps:
+// 1. Concurrent Verification: Fan-out verification across N attempts (Lock check, Size, Hash).
+// 2. Action Execution: Hand off verified files to the ActionHandler (SFTP or Script).
+// 3. Post-Processing: Archive, Delete, or Compress files that were successfully handled.
+// 4. Activity Reporting: Log the results of the entire batch execution to the activity log.
 func (e *Engine) processFiles(ctx context.Context, files []string) {
 	summary := ExecutionSummary{
 		StartTime: time.Now(),
@@ -150,14 +362,17 @@ func (e *Engine) processFiles(ctx context.Context, files []string) {
 
 	// STEP 1: CONCURRENT INTEGRITY VERIFICATION
 	// Each file is checked across N attempts to ensure it's not being modified.
+	// This uses a fan-out pattern to verify multiple files in parallel.
 	for _, f := range files {
 		wg.Add(1)
 		go func(path string) {
 			defer wg.Done()
 
+			// Verifier checks for both Windows file locks and property stability (hash/size/timestamp)
 			ok, err := e.verifier.Verify(ctx, path)
 			if err != nil {
 				// Individual file errors go to the Activity Log, not the System Event Log
+				// We use a mutex to safely collect results from multiple goroutines.
 				mu.Lock()
 				summary.Errors = append(summary.Errors, FileProcessInfo{
 					Path:  path,
@@ -176,17 +391,14 @@ func (e *Engine) processFiles(ctx context.Context, files []string) {
 
 	wg.Wait()
 
-	// Exit early if nothing to do
-	if len(verifiedFiles) == 0 && len(summary.Errors) == 0 {
-		return
-	}
-
 	// STEP 2: ACTION EXECUTION (SFTP OR SCRIPT)
+	// Only files that passed the integrity check are processed.
 	if len(verifiedFiles) > 0 {
+		// The handler (SFTP or Script) manages its own internal concurrency pool.
 		processedFiles, err := e.handler.Execute(ctx, verifiedFiles)
 		if err != nil {
-			// System-level action failures (e.g., SFTP down) are logged to the System Event Log
-			e.logError(fmt.Sprintf("Action execution failed: %v", err))
+			// System-level action failures (e.g., SFTP connection down) are logged to the System Event Log/EventViewer.
+			e.logError(fmt.Sprintf("[Engine:Action] Action execution failed: %v", err))
 		}
 
 		// Update activity summary with results from the handler
@@ -205,10 +417,10 @@ func (e *Engine) processFiles(ctx context.Context, files []string) {
 		}
 
 		// STEP 3: POST-PROCESSING (ARCHIVE/DELETE)
-		// Only performed on files successfully handled in Step 2.
+		// Only performed on files successfully handled in Step 2 to ensure no data loss.
 		if len(processedFiles) > 0 {
 			if err := e.archiver.Process(ctx, processedFiles); err != nil {
-				e.logError(fmt.Sprintf("Post-processing failed: %v", err))
+				e.logError(fmt.Sprintf("[Engine:Archive] Post-processing failed: %v", err))
 			}
 		}
 	}
@@ -217,7 +429,7 @@ func (e *Engine) processFiles(ctx context.Context, files []string) {
 	// Writes the per-execution report to the file system (if configured).
 	if e.customLog != nil {
 		if err := e.customLog.LogExecution(summary); err != nil {
-			e.logError(fmt.Sprintf("Failed to write activity log: %v", err))
+			e.logError(fmt.Sprintf("[Engine:Logging] Failed to write activity log: %v", err))
 		}
 	}
 }
@@ -227,6 +439,12 @@ func (e *Engine) getFileInfo(path string, errMsg string) FileProcessInfo {
 		Path:  path,
 		Error: errMsg,
 	}
+	// Use absolute path for consistency if possible, otherwise keep original
+	absPath, err := filepath.Abs(path)
+	if err == nil {
+		info.Path = absPath
+	}
+
 	stat, err := os.Stat(path)
 	if err == nil {
 		info.Size = stat.Size()
@@ -242,30 +460,24 @@ func (e *Engine) getFileInfo(path string, errMsg string) FileProcessInfo {
 }
 
 func (e *Engine) logError(msg string) {
-	e.logProcess("ERROR: " + msg)
-	if e.logger != nil {
-		if err := e.logger.Error(1, msg); err != nil {
-			log.Printf("Failed to log error: %v (message: %s)", err, msg)
+	if e != nil {
+		e.logProcess("ERROR: " + msg)
+		if e.logger != nil {
+			if err := e.logger.Error(1, msg); err != nil {
+				log.Printf("Failed to log error: %v (message: %s)", err, msg)
+			}
+		} else {
+			log.Println(msg)
 		}
-	} else {
-		log.Println(msg)
 	}
 }
 
 func (e *Engine) logProcess(msg string) {
-	if e.customLog != nil {
+	if e != nil && e.customLog != nil {
 		if err := e.customLog.LogProcess(msg); err != nil {
 			log.Printf("Failed to write process log: %v (message: %s)", err, msg)
 		}
 	}
-}
-
-type engineLoggerWrapper struct {
-	Logger
-}
-
-func (w *engineLoggerWrapper) Warn(msg string) {
-	_ = w.Info(2, "Warning: "+msg)
 }
 
 type cliLogger struct{}

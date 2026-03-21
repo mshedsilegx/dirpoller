@@ -1,29 +1,15 @@
 # DirPoller
 
-Efficient Go-based Windows Directory Poller (Windows Server 2019+) for automated file monitoring, verification, and secure transfer.
+Efficient Go-based Multi-Platform Directory Poller (Windows Server 2019+, Linux) for automated file monitoring, verification, and secure transfer.
 
 ## Overview and Objectives
 DirPoller is designed for high-performance directory monitoring in enterprise environments. It provides a robust way to:
-1.  **Monitor** directories using multiple polling strategies (Interval, Batch, or Real-time Events).
-2.  **Verify** file integrity before processing to ensure files are fully committed and not locked.
-3.  **Execute** automated actions such as high-performance multi-threaded SFTP uploads or local script execution.
+1.  **Monitor** directories using multiple polling strategies (Interval, Batch, Event, or Trigger).
+2.  **Verify** file integrity before processing using high-performance XXH3-128 hashing or property stability (size/timestamp).
+3.  **Execute** automated actions such as high-performance multi-threaded SFTP uploads (with Atomic Upload Protocol) or local script execution.
 4.  **Archive** processed files using datestamped folders or consolidated high-efficiency `zstd` compression.
 
-The application can run as a standalone CLI or be installed as a native Windows Service with full EventLog integration.
-
-## Architecture and Design Choices
--   **Go-Based**: Leverages Go's efficient concurrency model for parallel integrity checks and multi-threaded SFTP uploads.
--   **Windows Native**: Uses `ReadDirectoryChangesW` for real-time events and `CreateFile` with specific sharing modes for robust lock detection on Windows Server 2019+.
--   **OS Isolation**: The application architecture is strictly decoupled. Platform-agnostic core logic (polling, integrity, actions) interacts with OS-native features through interfaces. Windows-specific implementations (e.g., `ReadDirectoryChangesW`, **Windows EventLog**, and `FILE_SHARE_NONE` locking) are isolated in `*_windows.go` files, while `*_linux.go` files provide a clean path for Linux support.
--   **Worker Pools**: Uses semaphore-controlled worker pools for SFTP transfers to optimize throughput without overwhelming system resources.
--   **Stream Processing**: Archiving logic uses `io.Copy` and streaming `zstd` writers to handle large files with minimal memory footprint.
-
-## Dependencies
--   **fsnotify/fsnotify**: Cross-platform file system notifications (used as a fallback for generic events).
--   **klauspost/compress/zstd**: High-performance multi-threaded zstd compression.
--   **pkg/sftp**: Robust SFTP client implementation.
--   **cespare/xxhash/v2**: Extremely fast non-cryptographic hash algorithm for file integrity.
--   **golang.org/x/sys/windows**: Direct access to Windows APIs for service management and EventLog.
+The application can run as a standalone CLI on Windows and Linux, or be installed as a native Windows Service (with full EventLog integration) or a Linux Systemd unit.
 
 ## Command Line Arguments
 | Argument | Type | Default | Description |
@@ -31,71 +17,134 @@ The application can run as a standalone CLI or be installed as a native Windows 
 | `-config` | String | (Required) | Full absolute path to the JSON configuration file. |
 | `-log` | String | `""` | Enable custom logging with a specific base log name. |
 | `-log-retention`| Integer | `0` | Number of days to keep logs (0 = disabled). |
-| `-name` | String | `""` | Custom Windows service name (optional, defaults to config or 'DirPoller'). |
-| `-install` | Boolean | `false` | Install the application as a native Windows service. |
-| `-remove` | Boolean | `false` | Stop and remove the Windows service and EventLog source. |
-| `-user` | String | `""` | Service account (e.g., `DOMAIN\User`). Defaults to `LocalSystem`. |
-| `-pass` | String | `""` | Password for the specified service account. |
-| `-debug` | Boolean | `false` | Run in interactive debug mode (console output for service events). |
+| `-name` | String | `""` | Service/Unit name. **Windows**: custom name (optional). **Linux**: REQUIRED `<unit_name>@<config_name>`. |
+| `-install` | Boolean | `false` | Install as a service (Windows Service / Linux systemd unit). |
+| `-remove` | Boolean | `false` | Remove a service (Windows Service / Linux systemd unit). |
+| `-user` | String | `""` | Service account. Windows: `DOMAIN\User` (optional). Linux: `user:group` (REQUIRED). |
+| `-pass` | String | `""` | Password for the service account (**Windows only**). |
+| `-debug` | Boolean | `false` | Run in interactive debug mode (console output). |
 | `-version` | Boolean | `false` | Print the application version and exit. |
 
-## Windows Service Management
-DirPoller provides native integration with the Windows Service Control Manager (SCM). 
+---
 
-### Administrative Requirements
-**Note**: You must run PowerShell or Command Prompt as **Administrator** to perform installation or removal.
+## Configuration File Reference
+
+This section provides a comprehensive reference for all configuration directives available in the DirPoller JSON configuration file. Its objective is to serve as a unified lookup for parameter names, their contexts, default values, and any constraints or enforcement rules applied during validation.
+
+| logical configuration block | config name | context | purpose | default value | constraint of context or enforcement of value |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Global** | `service_name` | String | Root | Custom name for the service instance (**Windows Only**). | `DirPoller` | Used as the Windows Service Name. On Linux, this is ignored; use the `-name` CLI flag instead. |
+| **Poll** | `directory` | `poll` | The local path to monitor for new files. | **Required** | Must be an absolute path. Path traversal (`..`) is forbidden. Must exist. |
+| **Poll** | `algorithm` | `poll` | Strategy for discovering files. | `interval` | Supported: `interval`, `batch`, `event`, `trigger`. |
+| **Poll** | `value` | `poll` | Parameter for the chosen algorithm. | `0` | `interval`: seconds (int). `batch`: file count (int). `trigger`: file pattern (string). |
+| **Poll** | `batch_timeout_seconds` | `poll` | Force processing timeout for batch/trigger. | `600` | Applied when algorithm is `batch` or `trigger`. |
+| **Integrity** | `algorithm` | `integrity` | Method to verify file stability. | `timestamp` | Supported: `hash` (XXH3-128), `timestamp`, `size`. |
+| **Integrity** | `attempts` | `integrity` | Number of stability checks. | `3` | Must be a positive integer. |
+| **Integrity** | `interval` | `integrity` | Seconds between stability checks. | `5` | Must be a positive integer. |
+| **Action** | `type` | `action` | The processing engine to execute. | **Required** | Supported: `sftp`, `script`. |
+| **Action** | `concurrent_connections`| `action` | Size of the worker pool for parallel tasks. | `CPU x 2` | Must be a positive integer. |
+| **Post-Process** | `action` | `action.post_process`| Lifecycle step after successful action. | `delete` | Supported: `delete`, `move_archive`, `move_compress`. |
+| **Post-Process** | `archive_path` | `action.post_process`| Target path for archive/compress actions. | Optional | Required for all post-actions (`move`, `compress` or `delete`) to host the `.staging` directory. Must be absolute. |
+| **SFTP** | `host` | `action.sftp` | Remote SFTP server hostname/IP. | **Required** | Must be provided if action type is `sftp`. |
+| **SFTP** | `port` | `action.sftp` | Remote SSH/SFTP port. | `22` | Standard SSH port. |
+| **SFTP** | `username` | `action.sftp` | SSH authentication username. | **Required** | Must be provided if action type is `sftp`. |
+| **SFTP** | `encrypted_password` | `action.sftp` | AES-256-GCM encrypted password. | Optional | Required if `ssh_key_path` is not used. Must be Base64 encoded. |
+| **SFTP** | `master_key_file` | `action.sftp` | Path to master key file (Linux). | `~/.secretprotector.key`| **Linux Only**. Must have owner-only permissions. |
+| **SFTP** | `master_key_env` | `action.sftp` | Name of master key env var (Windows). | `SECRETPROTECTOR_KEY` | **Windows Only**. Should be a user-level environment variable. |
+| **SFTP** | `ssh_key_path` | `action.sftp` | Path to private SSH key. | Optional | Must be an absolute path. Path traversal forbidden. |
+| **SFTP** | `ssh_key_passphrase` | `action.sftp` | Passphrase for the private SSH key. | Optional | Used to decrypt the private key if it's encrypted. |
+| **SFTP** | `host_key` | `action.sftp` | Base64 encoded public host key. | Optional | Used for server identity verification. |
+| **SFTP** | `remote_path` | `action.sftp` | Target directory on the SFTP server. | **Required** | Must be an absolute path (starts with `/`). Path traversal forbidden. |
+| **Script** | `path` | `action.script` | Path to the local script or binary. | **Required** | Must be an absolute path. Path traversal forbidden. Must exist. |
+| **Script** | `timeout_seconds` | `action.script` | Max execution time per file. | `60` | Script is killed if it exceeds this duration. |
+| **Logging** | `log_name` | `logging[]` | Base absolute path for log files. | **Required** | Must be an absolute path. |
+| **Logging** | `log_retention` | `logging[]` | Number of days to retain logs. | `0` | `0` means retention is disabled (logs kept indefinitely). |
+
+---
+
+## Service Management (Windows & Linux)
+DirPoller provides native integration with the Windows Service Control Manager (SCM). On Linux, it can be run as a systemd unit using the provided service file.
+
+### Platform Differences
+- **Windows**: Supports automated installation/removal via `-install` and `-remove`. Uses the Service Control Manager and logs to the **Windows Event Log**. Requires Administrator privileges.
+- **Linux**: Supports automated installation/removal via `-install` and `-remove` (using `sudo`). Uses **Systemd Parameterized Units** (`unit@config.service`) and logs to `syslog` or `journald`. Requires root privileges.
 
 ### Installation
-The `-install` command handles service creation and EventLog source registration.
+**1. Windows (PowerShell Administrator):**
+The `-install` command handles service creation and system log source registration.
 
-**1. Using LocalSystem (Default):**
+- **Using LocalSystem (Default):**
 ```powershell
 .\dirpoller.exe -install -config "C:\Program Files\DirPoller\config.json"
 ```
 
-**2. Using a Service Account:**
+- **Using a Service Account:**
 ```powershell
 .\dirpoller.exe -install -config "C:\Program Files\DirPoller\config.json" -user "MYDOMAIN\svc_poller" -pass "SecurePass123"
 ```
 
+**2. Linux (Sudo):**
+The `-install` command handles template deployment to `/etc/systemd/system/` and instance enablement via `systemctl enable`. It does not start the service. File `dirpoller.service` is provided in the repository as an indication of the unit specs.
+
+- **Standard Installation:**
+```bash
+sudo ./dirpoller -install -name "dirpoller@config1" -config "/etc/dirpoller/config1.json" -user "polleruser:users"
+```
+*Note: This creates `/etc/systemd/system/dirpoller@.service` and enables the `dirpoller@config1` instance. Configuration file `/etc/dirpoller/config1.json` must be created prior. Service can then be started via `systemctl start dirpoller@config1`.*
+
 ### Removal
-The `-remove` command gracefully stops the service (if running), deletes it from the SCM, and unregisters the EventLog source.
+**Windows:**
+The `-remove` command gracefully stops the service and removes it from the system. It deletes the service from the SCM and unregisters the EventLog source.
 ```powershell
 .\dirpoller.exe -remove -config "C:\Program Files\DirPoller\config.json"
 ```
 
-### Service Control and Monitoring
-Once installed, the service is named `DirPoller` (or your custom name) and can be managed using standard Windows commands or the GUI.
+**Linux:**
+The `-remove` command stops the instance via `systemctl stop`, disables it via `systemctl disable`, and removes the template unit file from `/etc/systemd/system/`.
+```bash
+sudo ./dirpoller -remove -name "dirpoller@config1"
+```
 
-#### Standard Commands
+### Service Control and Monitoring
+Once installed, the service (named `DirPoller` or a custom name)) can be managed using standard OS commands or GUI.
+
+#### Windows (PowerShell)
 - **Start**: `Start-Service DirPoller` or `net start DirPoller`
 - **Stop**: `Stop-Service DirPoller` or `net stop DirPoller`
 - **Restart**: `Restart-Service DirPoller`
 - **Status**: `Get-Service DirPoller` or `sc.exe query DirPoller`
 
-*Note: Replace `DirPoller` with your custom name if provided during installation.*
 
-#### Verifying Logs
-DirPoller logs all critical events (startup, errors, processing summaries) to the **Windows Event Log**.
-1. Open **Event Viewer** (`eventvwr.msc`).
-2. Navigate to `Windows Logs` -> `Application`.
-3. Look for the Source: `DirPoller`.
+#### Linux (Systemd)
+- **Start**: `sudo systemctl start dirpoller@config1`
+- **Stop**: `sudo systemctl stop dirpoller@config1`
+- **Restart**: `sudo systemctl restart dirpoller@config1`
+- **Status**: `sudo systemctl status dirpoller@config1`
+
+*Note: Replace `dirpoller@config1` with your specific `<unit_name>@<config_name>`.*
+
+### Verifying Logs
+DirPoller logs all critical events (startup, errors, processing summaries) to the native system logger.
+
+- **Windows**: 
+  1. Open **Event Viewer** (`eventvwr.msc`).
+  2. Navigate to `Windows Logs` -> `Application`.
+  3. Look for the Source: `DirPoller`.
+- **Linux**: Use `journalctl -u dirpoller@config1` or check `/var/log/syslog`.
 
 #### Troubleshooting
 If the service fails to start:
-1. Check the Event Log for specific error messages.
+1. Check the Event Log (Windows) or Journal (Linux) for specific error messages.
 2. Ensure the configuration file path provided during installation is an **absolute path** and is readable by the service account.
-3. Run `.\dirpoller.exe -debug -config ...` to see real-time output in the console.
+3. Run `.\dirpoller.exe -debug -config ...` (Windows) or `./dirpoller -debug -config ...` (Linux) to see real-time output in the console.
 
 ## Configuration JSON File
-DirPoller is entirely driven by a structured JSON configuration. For reliability—especially when running as a Windows Service—all file and directory paths **must be absolute**.
-
-The configuration is divided into four functional blocks:
+DirPoller is entirely driven by a structured JSON configuration. For reliability—especially when running as a system service—all file and directory paths **must be absolute**.
 
 ### 1. Global Settings
 | Property | Type | Default | Logic / Purpose |
 | :--- | :--- | :--- | :--- |
-| `service_name` | String | `DirPoller` | Custom name for the Windows service instance. |
+| `service_name` | String | `DirPoller` | Custom name for the service instance (**Windows ONLY**). Ignored on Linux. |
 
 ### 2. Polling Strategy (`poll`)
 Determines how the application discovers files in the target directory.
@@ -108,9 +157,9 @@ Determines how the application discovers files in the target directory.
 | `batch_timeout_seconds` | Integer | `600` | Used in `batch` and `trigger` modes. Forces processing if the threshold or trigger is not met within this period. |
 
 **Algorithm Details:**
-*   **`interval`**: Performs a full directory scan at fixed time steps. Reliable for all storage types.
+*   **`interval`**: Performs a full directory scan at fixed time steps. Reliable for all storage types and OS platforms.
 *   **`batch`**: Collects files as they arrive but waits until a specific volume is reached before executing actions.
-*   **`event`**: Uses Windows `ReadDirectoryChangesW` for real-time, low-overhead detection. Best for high-traffic local disks.
+*   **`event`**: Uses real-time OS APIs (`ReadDirectoryChangesW` on Windows, `inotify` on Linux) for low-overhead detection. Best for high-traffic local disks.
 *   **`trigger`**: Waits for a specific "trigger file" (exact name or wildcard) to appear before processing all pending files in the directory.
 
 ---
@@ -125,8 +174,10 @@ A safety gate that ensures files are fully written and closed by the source proc
 | `interval` | Integer | `5` | Seconds to wait between each verification attempt. |
 
 **Verification Flow:**
-1.  **Lock Check**: DirPoller first attempts to open the file with exclusive access (`FILE_SHARE_NONE`). If Windows reports a sharing violation, the file is skipped.
-2.  **Stability Check**: Once unlocked, the chosen `algorithm` is used. If the property (e.g., file size) changes between any of the `attempts`, the counter resets.
+1.  **Lock Check**: 
+    - **Windows**: Attempts to open the file with exclusive access (`FILE_SHARE_NONE`) using native `CreateFile`. If Windows reports a sharing violation, the file is skipped.
+    - **Linux**: Uses `flock` (`LOCK_EX|LOCK_NB`) to detect active writes or locks.
+2.  **Stability Check**: Once unlocked/available, the chosen `algorithm` is used. If the property (e.g., file size) changes between any of the `attempts`, the counter resets.
 
 ---
 
@@ -143,7 +194,9 @@ Defines the primary task to perform on verified files.
 | :--- | :--- | :--- | :--- |
 | `host` / `port` | Mix | Req / `22` | Connection details for the remote server. |
 | `username` | String | **Required** | SSH/SFTP username. |
-| `password` | String | Optional | Used for standard password auth OR as the second factor in MFA. |
+| `encrypted_password` | String | Optional | AES-256-GCM encrypted password (Base64). Mandatory if not using SSH key. |
+| `master_key_file` | String | Optional | **Linux ONLY**: Path to the master key file (default: `~/.secretprotector.key`). |
+| `master_key_env` | String | Optional | **Windows ONLY**: Name of the user-level environment variable (default: `SECRETPROTECTOR_KEY`). |
 | `ssh_key_path` | String | Optional | Absolute path to a private SSH key (OpenSSH format). |
 | `ssh_key_passphrase` | String | Optional | The passphrase required to decrypt the private key file (if encrypted). |
 | `host_key` | String | Optional | Base64 encoded public host key for server verification (prevents MitM). |
@@ -152,7 +205,7 @@ Defines the primary task to perform on verified files.
 #### Script Handler (`action.script`)
 | Property | Type | Default | Logic / Purpose |
 | :--- | :--- | :--- | :--- |
-| `path` | String | **Required** | Absolute path to the script or executable. Supports `.exe`, `.bat`, `.cmd`, `.ps1`, etc. |
+| `path` | String | **Required** | Absolute path to the script or executable. Supports `.exe`, `.bat`, `.cmd`, `.ps1` (Windows) or any executable script/binary (Linux). |
 | `timeout_seconds` | Integer | `60` | Maximum time allowed for the script to run per file before being killed. |
 
 ---
@@ -163,7 +216,7 @@ Determines what happens to the local file after the Action Handler confirms a su
 | Property | Type | Default | Logic / Purpose |
 | :--- | :--- | :--- | :--- |
 | `action` | String | `delete` | Local lifecycle step: `delete`, `move_archive`, or `move_compress`. |
-| `archive_path` | String | Optional | Required if `action` is a move or compress operation. |
+| `archive_path` | String | Optional | Required for all post-actions (`move`, `compress` or `delete`) to host the `.staging` directory. |
 
 **Action Details:**
 *   **`delete`**: The file is permanently removed from the local `directory`.
@@ -177,18 +230,18 @@ DirPoller implements a dual-track logging system to separate operational events 
 
 | Property | Type | Default | Logic / Purpose |
 | :--- | :--- | :--- | :--- |
-| `log_name` | String | **Required** | Base name for the log file (e.g., `C:\Logs\poller.log`). |
+| `log_name` | String | **Required** | Base name for the log file (e.g., `C:\Logs\poller.log` or `/var/log/dirpoller.log`). |
 | `log_retention` | Integer | `0` | Number of days to keep logs. If `0`, retention is disabled. |
 
 #### Log Separation Concept
 1.  **System Process Log (Daily)**: Records process-level events such as service start/stop, OS resource issues, and critical system errors (e.g., SFTP connection failures).
-    - **Windows Integration**: These events are always logged to the **Windows Application Event Log** (Source: `DirPoller`). If `-log` is specified, they are also mirrored to the daily process log file.
+    - **System Integration**: These events are always logged to the **Windows Application Event Log** (Source: `DirPoller`) or **Linux Syslog/Journald**. If `-log` is specified, they are also mirrored to the daily process log file.
     - **Naming**: `base_process_YYYYMMDD.log`
     - **Format**: `date stamp|message`
 2.  **Activity Log (Per Execution)**: Detailed report of files discovered, verified, and processed in a single cycle. Includes individual file integrity or action errors.
-    - **Windows Integration**: Activity logs are **NOT** logged to the Windows Event Log. They are file-system ONLY (requires `-log` or JSON config).
+    - **System Integration**: Activity logs are **NOT** logged to the system event log. They are file-system ONLY (requires `-log` or JSON config).
     - **Naming**: `base_activity_YYYYMMDD-HHMMSS.log`
-    - **Format**: Structured sections for Status, Successes, and Errors.
+    - **Format**: Structured sections for Status, Successes, and Errors. Includes XXH3-128 hashes for all processed files.
 
 #### Example: System Process Log
 `C:\Logs\poller_process_20260310.log`
@@ -207,25 +260,108 @@ DirPoller implements a dual-track logging system to separate operational events 
 2026-03-10 08:00:05|number of files in error: 1
 ------
 # List of files processed successfully
-2026-03-10 08:00:05|C:\Data\In\file1.txt|1024|a1b2c3d4e5f6g7h8
-2026-03-10 08:00:05|C:\Data\In\file2.txt|2048|b2c3d4e5f6g7h8i9
+2026-03-10 08:00:05|C:\Data\In\file1.txt|1024|a1b2c3d4e5f6g7h8a1b2c3d4e5f6g7h8
+2026-03-10 08:00:05|C:\Data\In\file2.txt|2048|b2c3d4e5f6g7h8i9b2c3d4e5f6g7h8i9
 ------
 # List of files in error
-2026-03-10 08:00:05|C:\Data\In\file3.txt in error|512|c3d4e5f6g7h8i9j0|action execution failed
+2026-03-10 08:00:05|C:\Data\In\file3.txt in error|512|c3d4e5f6g7h8i9j0c3d4e5f6g7h8i9j0|action execution failed
 ```
 
 **Auto-Purge**: Log retention logic executes **once per day** (at the start of the first execution after 00:00:00). Both process and activity logs older than the `log_retention` period are automatically deleted to minimize filesystem overhead.
 
-### 6. Multi-Directory Support (Concurrent Services)
-DirPoller supports running multiple instances as separate Windows services. Each instance must have a unique `service_name` and a unique `poll.directory`.
+### 6. Password Encryption (`action.sftp`)
+DirPoller implements mandatory password encryption for SFTP to ensure sensitive credentials are never stored in plaintext.
 
-#### Service Name Precedence
-The service name is determined using the following priority:
+#### Objective
+Secure SFTP credentials at rest and in memory. Plaintext passwords are strictly forbidden in the JSON configuration; only AES-256-GCM encrypted ciphertexts are accepted.
+
+#### 1. Generate the Master Key
+Use the `secretprotector` CLI utility to generate a cryptographically secure 32-byte master key (64-character hex string).
+```powershell
+secretprotector -generate
+# Output: a1b2c3d4e5f6... (64 chars)
+```
+
+#### 2. Store the Key Securely
+The application performs platform-specific security checks and follows strict location rules:
+
+##### **Windows (Environment Variable)**
+The master key **must** be stored in a **user-level** environment variable for the account running the service.
+1.  Open **PowerShell** as the user who will run the service (or use `setx` for permanent user-level storage). The variable name is configurable via `master_key_env`.
+2.  Set the variable (default name: `SECRETPROTECTOR_KEY`):
+    ```powershell
+    # Permanent user-level assignment
+    setx SECRETPROTECTOR_KEY "YOUR_64_CHAR_HEX_KEY"
+    ```
+3.  **Note**: If running as `LocalSystem`, you must set this as a **System** environment variable via System Properties > Environment Variables, or by using the `setx SECRETPROTECTOR_KEY "YOUR_64_CHAR_HEX_KEY" /M` command.
+
+##### **Linux (Key File)**
+The master key **must** be stored in a file with owner-only permissions. The master key file name/location is configurable via `master_key_file`.
+1.  Create the key file (default: `${HOME}/.secretprotector.key`):
+    ```bash
+    echo "YOUR_64_CHAR_HEX_KEY" > ~/.secretprotector.key
+    ```
+2.  Restrict permissions:
+    ```bash
+    chmod 0400 ~/.secretprotector.key
+    ```
+
+#### 3. Generate the Encrypted Password
+Once the master key is set in your environment (Windows) or file (Linux), use `secretprotector` to encrypt your plaintext SFTP password.
+
+**Windows:**
+```powershell
+# Ensure the variable is available in the current session
+$env:SECRETPROTECTOR_KEY = "YOUR_64_CHAR_HEX_KEY"
+.\secretprotector.exe -encrypt "YourPlaintextPassword"
+# Output: BASE64_ENCRYPTED_STRING...
+```
+
+**Linux:**
+```bash
+./secretprotector -key-file "~/.secretprotector.key" -encrypt "YourPlaintextPassword"
+# Output: BASE64_ENCRYPTED_STRING...
+```
+
+#### 4. Update the Configuration
+Insert the `BASE64_ENCRYPTED_STRING` into your `config.json` under `encrypted_password`.
+
+**Example:**
+```json
+{
+  "action": {
+    "type": "sftp",
+    "sftp": {
+      "host": "sftp.example.com",
+      "username": "svc_poller",
+      "encrypted_password": "BASE64_ENCRYPTED_STRING...",
+      "master_key_env": "SECRETPROTECTOR_KEY"
+    }
+  }
+}
+```
+
+#### 5. Resolution Logic
+The engine resolves the key based on the operating system:
+- **Windows**: Resolves **ONLY** from the user-level environment variable specified in `master_key_env` (or the default). Key files 
+are ignored.
+- **Linux**: Resolves **ONLY** from the path specified in `master_key_file` (or the default). Environment variables are 
+ignored.
+
+---
+
+### 7. Multi-Directory Support (Concurrent Services)
+DirPoller supports running multiple instances as separate system services. Each instance must have a unique `service_name` and a unique `poll.directory`.
+
+#### Service Name Precedence (Windows ONLY)
+The service name on Windows is determined using the following priority:
 1.  **CLI Flag (`-name`)**: Overrides everything else if provided.
 2.  **Config File (`service_name`)**: Used if the CLI flag is omitted.
 3.  **Default**: Defaults to `"DirPoller"` if not specified in either.
 
-#### Installation Example
+**Note**: On Linux, the service name is strictly managed via the `-name` CLI flag in `unit@instance` format. The `service_name` config directive is ignored.
+
+#### Installation Example (Windows)
 To install two separate pollers monitoring different directories:
 
 **Instance 1 (Direct to SFTP):**
@@ -238,7 +374,7 @@ To install two separate pollers monitoring different directories:
 .\dirpoller.exe -install -name "Poller_HR" -config "C:\Configs\hr.json"
 ```
 
-#### Management Example
+#### Management Example (Windows)
 You can then manage these services independently using their assigned names:
 ```powershell
 # Start the Finance poller
@@ -249,17 +385,30 @@ Get-Service Poller_HR
 
 # Remove the Finance poller
 .\dirpoller.exe -remove -name "Poller_Finance" -config "C:\Configs\finance.json"
+
+#### Installation Example (Linux)
+To install two separate pollers monitoring different directories using the same unit template:
+
+**Instance 1 (Finance):**
+```bash
+sudo ./dirpoller -install -name "dirpoller@finance" -config "/etc/dirpoller/finance.json" -user "financeuser:users"
+```
+
+**Instance 2 (HR):**
+```bash
+sudo ./dirpoller -install -name "dirpoller@hr" -config "/etc/dirpoller/hr.json" -user "hruser:users"
 ```
 
 ---
 
-### Full Configuration Example
+### Full Configuration Example (Windows - SFTP)
 ```json
 {
   "service_name": "MyCustomPoller",
   "poll": {
     "directory": "C:\\Data\\Incoming",
-    "algorithm": "event"
+    "algorithm": "event",
+    "batch_timeout_seconds": 600
   },
   "integrity": {
     "algorithm": "hash",
@@ -277,9 +426,11 @@ Get-Service Poller_HR
       "host": "sftp.internal.net",
       "port": 22,
       "username": "svc_poller",
+      "encrypted_password": "BASE64_ENCRYPTED_STRING...",
+      "master_key_env": "SECRETPROTECTOR_KEY",
       "ssh_key_path": "C:\\ProgramData\\DirPoller\\keys\\id_ed25519",
-      "ssh_key_passphrase": "my-secret-pass",
-      "host_key": "AAAA...",
+      "ssh_key_passphrase": "optional-passphrase",
+      "host_key": "ssh-ed25519 AAAAC3Nza...",
       "remote_path": "/incoming/raw"
     }
   },
@@ -292,9 +443,111 @@ Get-Service Poller_HR
 }
 ```
 
-## Build
-To build a production-ready, security-hardened binary for Windows, use the following template in a PowerShell script. This ensures a statically linked, position-independent executable (PIE) with all debug symbols stripped.
+### Full Configuration Example (Linux - SFTP)
+```json
+{
+  "service_name": "dirpoller-finance",
+  "poll": {
+    "directory": "/opt/dirpoller/incoming",
+    "algorithm": "interval",
+    "value": 60
+  },
+  "integrity": {
+    "algorithm": "timestamp",
+    "attempts": 5,
+    "interval": 10
+  },
+  "action": {
+    "type": "sftp",
+    "concurrent_connections": 8,
+    "post_process": {
+      "action": "move_archive",
+      "archive_path": "/opt/dirpoller/archive"
+    },
+    "sftp": {
+      "host": "sftp.example.com",
+      "port": 2222,
+      "username": "poller_user",
+      "encrypted_password": "BASE64_ENCRYPTED_STRING...",
+      "master_key_file": "/home/dirpoller/.secretprotector.key",
+      "ssh_key_path": "/home/dirpoller/.ssh/id_rsa",
+      "ssh_key_passphrase": "secure-passphrase",
+      "host_key": "ssh-ed25519 AAAAC3Nza...",
+      "remote_path": "/remote/upload"
+    }
+  },
+  "logging": [
+    {
+      "log_name": "/var/log/dirpoller.log",
+      "log_retention": 30
+    }
+  ]
+}
+```
 
+### Full Configuration Example (Windows - Script)
+```json
+{
+  "service_name": "ScriptPollerWin",
+  "poll": {
+    "directory": "C:\\Data\\Manual",
+    "algorithm": "trigger",
+    "value": "ready.txt",
+    "batch_timeout_seconds": 300
+  },
+  "integrity": {
+    "algorithm": "size",
+    "attempts": 2,
+    "interval": 1
+  },
+  "action": {
+    "type": "script",
+    "concurrent_connections": 2,
+    "post_process": {
+      "action": "delete"
+    },
+    "script": {
+      "path": "C:\\Scripts\\process_batch.ps1",
+      "timeout_seconds": 120
+    }
+  }
+}
+```
+
+### Full Configuration Example (Linux - Script)
+```json
+{
+  "service_name": "script-poller-linux",
+  "poll": {
+    "directory": "/tmp/poller/in",
+    "algorithm": "batch",
+    "value": 10,
+    "batch_timeout_seconds": 120
+  },
+  "integrity": {
+    "algorithm": "size",
+    "attempts": 3,
+    "interval": 2
+  },
+  "action": {
+    "type": "script",
+    "concurrent_connections": 4,
+    "post_process": {
+      "action": "move_archive",
+      "archive_path": "/tmp/poller/done"
+    },
+    "script": {
+      "path": "/usr/local/bin/process_files.sh",
+      "timeout_seconds": 30
+    }
+  }
+}
+```
+
+## Build
+To build production-ready binaries, use the following templates. This ensures statically linked, position-independent executables (PIE) with debug symbols stripped.
+
+### Windows Build (PowerShell)
 ```powershell
 # Environment Setup
 $env:GOPROXY="https://proxy.golang.org,direct"
@@ -310,6 +563,16 @@ go build -v `
     -ldflags "-s -w -X main.version=$version-$(git rev-parse --short HEAD)" `
     -o ./bin/dirpoller.exe `
     ./cmd/dirpoller
+
+go build -v -trimpath -buildmode=pie -ldflags "-s -w -X main.version=$version" -o ./bin/dirpoller.exe ./cmd/dirpoller
+```
+
+### Linux Build (Bash)
+```bash
+export GOPROXY="https://proxy.golang.org,direct"
+export CGO_ENABLED=0
+go build -v -buildvcs=false -trimpath -buildmode=pie \
+  -ldflags "-s -w -X main.version=$(cat version.txt)" -o ./bin/ ./cmd/dirpoller
 ```
 
 ### Build Parameters:
@@ -320,7 +583,7 @@ go build -v `
 -   **-buildmode=pie**: Generates a Position Independent Executable for enhanced exploit mitigation.
 -   **-ldflags "-s -w ..."**: 
     - `-s -w`: Strips the symbol table and DWARF debug information (reduces binary size).
-    - `-X main.version`: Injects the specific version and git commit hash into the application.
+    - `-X main.version`: Injects the specific version into the application.
 
 ---
 
@@ -328,45 +591,76 @@ go build -v `
 
 ### 1. Interactive CLI Mode
 Run DirPoller directly in your terminal to monitor a directory.
+
+**Windows:**
 ```powershell
 .\dirpoller.exe -config "C:\Configs\prod_config.json"
 ```
 
+**Linux:**
+```bash
+/usr/local/bin/dirpoller -config "/etc/dirpoller/prod_config.json"
+```
+
 ### 2. Troubleshooting with Debug Mode
 Use the `-debug` flag to enable verbose logging. This is highly recommended when testing new configurations or SFTP connectivity.
-```powershell
-.\dirpoller.exe -debug -config ".\test_config.json"
-```
 
 ### 3. Version Verification
 Check the installed version and build hash.
 ```powershell
-.\dirpoller.exe -version
+dirpoller -version
 ```
 
 ### 4. Service Installation (Service Account)
-Install as a background service using a dedicated service account.
+
+**Windows:**
+Install as a background service on Windows using a dedicated service account (administrative account required).
 ```powershell
 .\dirpoller.exe -install -config "C:\DirPoller\config.json" -user "CORP\svc_poller" -pass "P@ssword123"
 ```
 
+**Linux:**
+The installer uses the `dirpoller@.service` parameterized units (root privileges required).
+  - **Unit Name**: Configured via the `-name <unit_name>@<config_name>` flag.
+  - **Config Mapping**: The `%i` specifier in the unit file maps to `<config_name>`, pointing to `/etc/dirpoller/<config_name>.json`.
+
+```bash
+dirpoller -install -name dirpoller@site-a -user dirpoller:apps
+```
+References `dirpoller@site-a.service` and uses `/etc/dirpoller/site-a.json` (as specified in the unit, path is manually configurable there). User and group can be specified via the `-user user:group` flag
+
+
 ### 5. Service Removal
 Stop and uninstall the service from the system.
+
+**Windows:**
 ```powershell
 .\dirpoller.exe -remove -config "C:\DirPoller\config.json"
 ```
 
+**Linux:**
+```bash
+sudo ./dirpoller -remove -config "/etc/dirpoller/config.json"
+```
+
 ### 6. Configuration with Logging
 Run DirPoller with custom logging and 14-day retention.
+
+**Windows:**
 ```powershell
 .\dirpoller.exe -config "C:\Configs\prod_config.json" -log "C:\Logs\prod_poller.log" -log-retention 14
+```
+
+**Linux:**
+```bash
+/usr/local/bindirpoller -config "/etc/dirpoller/config.json -log "/var/log/dirpoller/poller.log" -log-retention 30
 ```
 
 ## Unit Tests
 DirPoller includes a comprehensive unit testing suite designed for high reliability and realistic Windows behavior.
 
 ### Objectives
-- **Realistic Simulation**: Tests use the Windows `%TEMP%` directory for real filesystem interactions.
+- **Realistic Simulation**: Tests use the Windows `%TEMP%` / Linux `$TEMP` directory for real filesystem interactions.
 - **Isolated Testing**: All external dependencies (SFTP, Windows Service Manager) are refactored into interfaces and fully mocked, allowing for complete logic verification without specialized infrastructure or administrator rights.
 - **Race Condition Prevention**: Test subdirectories are uniquely isolated per-test to support parallel execution.
 

@@ -1,3 +1,15 @@
+// Package poller_test provides unit tests for the Trigger polling algorithm.
+//
+// Objective:
+// Validate the "Trigger File" discovery strategy, ensuring that files are
+// collected but only dispatched once a specific trigger file pattern is
+// matched in the directory.
+//
+// Scenarios Covered:
+//   - Trigger Match: Verification that files are flushed when the trigger appears.
+//   - Timeout Flush: Confirms that files are eventually dispatched even if no
+//     trigger appears, based on the BatchTimeoutSeconds setting.
+//   - Pattern Matching: Ensures exact and wildcard matches for trigger files.
 package poller
 
 import (
@@ -8,16 +20,22 @@ import (
 	"time"
 
 	"criticalsys.net/dirpoller/internal/config"
+	"criticalsys.net/dirpoller/internal/testutils"
 )
 
+// TestTriggerPoller verifies both trigger-based and timeout-based flushing.
+//
+// Scenario:
+// 1. Initialize TriggerPoller with "trigger.txt" pattern and 2s timeout.
+// 2. Add a data file and then create the trigger file.
+// 3. Verify immediate dispatch upon trigger detection.
+// 4. Add another data file and wait for the timeout.
+//
+// Success Criteria:
+// - Files are dispatched immediately when the trigger file is created.
+// - Files are dispatched after the timeout period if no trigger is found.
 func TestTriggerPoller(t *testing.T) {
-	testDir, err := os.MkdirTemp("", "TriggerPollerTest")
-	if err != nil {
-		t.Fatalf("failed to create test dir: %v", err)
-	}
-	defer func() {
-		_ = os.RemoveAll(testDir)
-	}()
+	testDir := testutils.GetUniqueTestDir("poller", "TriggerPollerTest")
 
 	cfg := &config.Config{
 		Poll: config.PollConfig{
