@@ -298,7 +298,14 @@ func validate(cfg *Config) error {
 		}
 
 		if cfg.Action.SFTP.HostKey != "" {
-			pubKeyData, err := base64.StdEncoding.DecodeString(cfg.Action.SFTP.HostKey)
+			// Handle full OpenSSH format (e.g., "ssh-ed25519 AAAAC3NzaC...")
+			parts := strings.Fields(cfg.Action.SFTP.HostKey)
+			base64Key := parts[0]
+			if len(parts) > 1 {
+				base64Key = parts[1]
+			}
+
+			pubKeyData, err := base64.StdEncoding.DecodeString(base64Key)
 			if err != nil {
 				return fmt.Errorf("failed to decode host key: %w", err)
 			}

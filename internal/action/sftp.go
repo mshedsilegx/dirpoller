@@ -383,8 +383,16 @@ func (h *SFTPHandler) connect() (SFTPClient, SSHClient, error) {
 	}
 
 	var hostKeyCallback ssh.HostKeyCallback
+	var sshConfig *ssh.ClientConfig
 	if h.cfg.Action.SFTP.HostKey != "" {
-		pubKeyData, err := base64.StdEncoding.DecodeString(h.cfg.Action.SFTP.HostKey)
+		// Handle full OpenSSH format (e.g., "ssh-ed25519 AAAAC3NzaC...")
+		parts := strings.Fields(h.cfg.Action.SFTP.HostKey)
+		base64Key := parts[0]
+		if len(parts) > 1 {
+			base64Key = parts[1]
+		}
+
+		pubKeyData, err := base64.StdEncoding.DecodeString(base64Key)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to decode host key: %w", err)
 		}
@@ -393,14 +401,20 @@ func (h *SFTPHandler) connect() (SFTPClient, SSHClient, error) {
 			return nil, nil, fmt.Errorf("failed to parse host key: %w", err)
 		}
 		hostKeyCallback = ssh.FixedHostKey(pubKey)
+		// Restrict HostKeyAlgorithms to only the provided algorithm
+		sshConfig = &ssh.ClientConfig{
+			User:            h.cfg.Action.SFTP.Username,
+			Auth:            authMethods,
+			HostKeyCallback: hostKeyCallback,
+			HostKeyAlgorithms: []string{pubKey.Type()},
+		}
 	} else {
 		hostKeyCallback = ssh.InsecureIgnoreHostKey() // #nosec G106 - Fallback if not provided
-	}
-
-	sshConfig := &ssh.ClientConfig{
-		User:            h.cfg.Action.SFTP.Username,
-		Auth:            authMethods,
-		HostKeyCallback: hostKeyCallback,
+		sshConfig = &ssh.ClientConfig{
+			User:            h.cfg.Action.SFTP.Username,
+			Auth:            authMethods,
+			HostKeyCallback: hostKeyCallback,
+		}
 	}
 
 	addr := fmt.Sprintf("%s:%d", h.cfg.Action.SFTP.Host, h.cfg.Action.SFTP.Port)

@@ -53,7 +53,7 @@ This section provides a comprehensive reference for all configuration directives
 | **SFTP** | `master_key_env` | `action.sftp` | Name of master key env var (Windows). | `SECRETPROTECTOR_KEY` | **Windows Only**. Should be a user-level environment variable. |
 | **SFTP** | `ssh_key_path` | `action.sftp` | Path to private SSH key. | Optional | Must be an absolute path. Path traversal forbidden. |
 | **SFTP** | `ssh_key_passphrase` | `action.sftp` | Passphrase for the private SSH key. | Optional | Used to decrypt the private key if it's encrypted. |
-| **SFTP** | `host_key` | `action.sftp` | Base64 encoded public host key. | Optional | Used for server identity verification. |
+| **SFTP** | `host_key` | `action.sftp` | Public host key. | Optional | Used for server identity verification. Supports: <br> - **RSA**: `ssh-rsa AAAAB3...` <br> - **ECDSA**: `ecdsa-sha2-nistp256 AAAAE2...` <br> - **ED25519**: `ssh-ed25519 AAAAC3...` <br> - **Raw Base64**: `AAAAC3...` |
 | **SFTP** | `remote_path` | `action.sftp` | Target directory on the SFTP server. | **Required** | Must be an absolute path (starts with `/`). Path traversal forbidden. |
 | **Script** | `path` | `action.script` | Path to the local script or binary. | **Required** | Must be an absolute path. Path traversal forbidden. Must exist. |
 | **Script** | `timeout_seconds` | `action.script` | Max execution time per file. | `60` | Script is killed if it exceeds this duration. |
@@ -199,7 +199,7 @@ Defines the primary task to perform on verified files.
 | `master_key_env` | String | Optional | **Windows ONLY**: Name of the user-level environment variable (default: `SECRETPROTECTOR_KEY`). |
 | `ssh_key_path` | String | Optional | Absolute path to a private SSH key (OpenSSH format). |
 | `ssh_key_passphrase` | String | Optional | The passphrase required to decrypt the private key file (if encrypted). |
-| `host_key` | String | Optional | Base64 encoded public host key for server verification (prevents MitM). |
+| `host_key` | String | Optional | Public host key for server verification. Supports: <br> - **RSA**: `ssh-rsa AAAAB3...` <br> - **ECDSA**: `ecdsa-sha2-nistp256 AAAAE2...` <br> - **ED25519**: `ssh-ed25519 AAAAC3...` <br> - **Raw Base64**: `AAAAC3...` |
 | `remote_path` | String | **Required** | The target directory on the SFTP server. |
 
 #### Script Handler (`action.script`)
@@ -430,7 +430,7 @@ sudo ./dirpoller -install -name "dirpoller@hr" -config "/etc/dirpoller/hr.json" 
       "master_key_env": "SECRETPROTECTOR_KEY",
       "ssh_key_path": "C:\\ProgramData\\DirPoller\\keys\\id_ed25519",
       "ssh_key_passphrase": "optional-passphrase",
-      "host_key": "ssh-ed25519 AAAAC3Nza...",
+      "host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINfFSlHZATKjPp9Vwg4l9Ecft2rYqObUItGg1YaYSVWH",
       "remote_path": "/incoming/raw"
     }
   },
@@ -472,7 +472,7 @@ sudo ./dirpoller -install -name "dirpoller@hr" -config "/etc/dirpoller/hr.json" 
       "master_key_file": "/home/dirpoller/.secretprotector.key",
       "ssh_key_path": "/home/dirpoller/.ssh/id_rsa",
       "ssh_key_passphrase": "secure-passphrase",
-      "host_key": "ssh-ed25519 AAAAC3Nza...",
+      "host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINfFSlHZATKjPp9Vwg4l9Ecft2rYqObUItGg1YaYSVWH",
       "remote_path": "/remote/upload"
     }
   },
@@ -655,6 +655,30 @@ Run DirPoller with custom logging and 14-day retention.
 ```bash
 /usr/local/bindirpoller -config "/etc/dirpoller/config.json -log "/var/log/dirpoller/poller.log" -log-retention 30
 ```
+
+### 7. SSH Host Key Formats (config.json)
+The `host_key` field supports four formats. Specifying the full OpenSSH format is recommended as it automatically restricts the handshake to the matching algorithm.
+
+**1. ED25519 (Recommended)**
+```json
+"host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINfFSlHZATKjPp9Vwg4l9Ecft2rYqObUItGg1YaYSVWH"
+```
+
+**2. RSA**
+```json
+"host_key": "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDq2NqQIu+oX6m03qqY7x8pMGF6sKyTdxgNMkgG4Ho3A..."
+```
+
+**3. ECDSA**
+```json
+"host_key": "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEcMMxz2+v6ERnGpHlcAK3bmgZqFKr+hs7nyQMpeS6RFWcZC0XalmfFpN5jxeQ2f7Xf0mRTLmAi1eemSvnrcShk="
+```
+
+**4. Raw Base64 (Legacy/Key-only)**
+```json
+"host_key": "AAAAC3NzaC1lZDI1NTE5AAAAINfFSlHZATKjPp9Vwg4l9Ecft2rYqObUItGg1YaYSVWH"
+```
+*Note: When using Raw Base64, the engine will attempt to detect the key type, but providing the prefix (e.g., `ssh-ed25519`) is safer for multi-algorithm servers.*
 
 ## Unit Tests
 DirPoller includes a comprehensive unit testing suite designed for high reliability and realistic Windows behavior.

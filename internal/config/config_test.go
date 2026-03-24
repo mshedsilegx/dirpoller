@@ -227,7 +227,6 @@ func TestConfigValidation_Comprehensive(t *testing.T) {
 				Type: ActionSFTP,
 				SFTP: SFTPConfig{
 					Host: "h", Username: "u", EncryptedPassword: "p", RemotePath: "/r",
-					HostKey: "AAAAC3NzaC1lZDI1NTE5AAAAILM+67VX7Oc26VYm8L2Iz5yT4qPlPrSgqS9A2t47ycHt",
 				},
 				PostProcess: PostProcessConfig{
 					Action:      PostActionDelete,
@@ -236,8 +235,19 @@ func TestConfigValidation_Comprehensive(t *testing.T) {
 			},
 		}
 		setDefaults(cfg)
-		if err := validate(cfg); err != nil {
-			t.Errorf("expected valid host key to pass, got %v", err)
+
+		hostKeys := []string{
+			"ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDq2NqQIu+oX6m03qqY7x8pMGF6sKyTdxgNMkgG4Ho3A+z8WqTX0wUGXSMaurtO8FBcbvZrFfT9utzQzNpkCEtEoGvHg73UovZwmQs2EidnNvDu+FgqSBNevqGvc0ZtZ3CTwbYfL6jg/kJVWm82+x4dFCRDroz9arDkBneqIaONqCPrGpPFYfVE21D9G+1CL6vfu7hTgYpVV8vSGkDGc5ipTyWYAzqcltaIqiAL7NSpeFIQ+R1sHJRrn3bwbH3eIimvOvtY16D74u7IGKV78QdL8zua86jvuf+VAe61hy0PiE6QYSla1LuxR3FSHDIidYwyB92Z8aJDu7VZULT60zIY5bzcHwBoGrUbDAcBY4nipURq+0FQOkY/RsiJff3L2/1De0k92Zug0v5MkOObk+59jz/1aoaxji7KpOKQQD/e2hXhHahF+aRswOwbVyUdc6J5qCKFSguXpxOG7EbvQgGFZdbE3HNpxxIn4/3Gce6vwIfHyzyMdVFFqCajXerFl1c=",
+			"ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEcMMxz2+v6ERnGpHlcAK3bmgZqFKr+hs7nyQMpeS6RFWcZC0XalmfFpN5jxeQ2f7Xf0mRTLmAi1eemSvnrcShk=",
+			"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINfFSlHZATKjPp9Vwg4l9Ecft2rYqObUItGg1YaYSVWH",
+			"AAAAC3NzaC1lZDI1NTE5AAAAINfFSlHZATKjPp9Vwg4l9Ecft2rYqObUItGg1YaYSVWH", // Base64 only
+		}
+
+		for _, hk := range hostKeys {
+			cfg.Action.SFTP.HostKey = hk
+			if err := validate(cfg); err != nil {
+				t.Errorf("expected host key %q to pass, got %v", hk, err)
+			}
 		}
 
 		cfg.Action.SFTP.HostKey = "!!!"
