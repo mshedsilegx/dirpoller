@@ -403,9 +403,9 @@ func (h *SFTPHandler) connect() (SFTPClient, SSHClient, error) {
 		hostKeyCallback = ssh.FixedHostKey(pubKey)
 		// Restrict HostKeyAlgorithms to only the provided algorithm
 		sshConfig = &ssh.ClientConfig{
-			User:            h.cfg.Action.SFTP.Username,
-			Auth:            authMethods,
-			HostKeyCallback: hostKeyCallback,
+			User:              h.cfg.Action.SFTP.Username,
+			Auth:              authMethods,
+			HostKeyCallback:   hostKeyCallback,
 			HostKeyAlgorithms: []string{pubKey.Type()},
 		}
 	} else {
