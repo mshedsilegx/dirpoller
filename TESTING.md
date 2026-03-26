@@ -104,7 +104,7 @@ To ensure tests do not interfere with source code or production data, all tests 
 | **Action** | `TestSFTPHandler_RealMockServer/PasswordAuth_Failure` | Verify SFTP behavior with invalid password. | Connection rejected with expected auth error. |
 | **Action** | `TestSFTPHandler_RealMockServer/KeyAuth_Failure` | Verify SFTP behavior with unauthorized SSH key. | Connection rejected with expected auth error. |
 | **Action** | `TestSFTPHandler_RealMockServer/MFA_Auth_PartialFailure` | Verify MFA behavior with valid key but bad pass. | Connection rejected after partial success. |
-| **Action** | `SFTP_HostKey_Validation` | Verify support for all host key formats. | Handshake succeeds for: <br> - `ssh-rsa` <br> - `ecdsa-sha2-nistp256` <br> - `ssh-ed25519` <br> - `Raw Base64` |
+| **Action** | `SFTP_HostKey_Validation` | Verify support for all host key formats. | Handshake succeeds for: `ssh-rsa`, `ecdsa-sha2-nistp256`, `ssh-ed25519`, `Raw Base64` |
 | **Action** | `TestSFTPHandler_RealMockServer/HostKeyVerification_Failure` | Verify connection with mismatched Host Key. | Connection rejected with host key mismatch error. |
 | **Action** | `TestSFTPHandler_Execute_Comprehensive` | Verify SFTP upload logic. | Files uploaded successfully or errors handled. |
 | **Action** | `TestSFTPHandler_Reconnect_Logic` | Verify reconnection on lost sessions. | Handler reconnects and retries successfully. |

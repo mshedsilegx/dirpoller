@@ -254,8 +254,9 @@ func TestSFTPHandler_Reconnect_Logic(t *testing.T) {
 		h.dialer = mDialer
 		h.client = &mockSFTPClientAdapter{mSFTP1}
 		h.conn = mSSH1
+		ctx := context.Background()
 
-		client, err := h.getOrCreateClient()
+		client, err := h.getOrCreateClient(ctx)
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}

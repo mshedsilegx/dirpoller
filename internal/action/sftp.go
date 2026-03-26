@@ -198,24 +198,6 @@ func (h *SFTPHandler) Execute(ctx context.Context, files []string) ([]string, er
 		}
 	}()
 
-	// 0. Security: Handle Secret Decryption (SFTP Password) per-batch
-	// This ensures decrypted credentials only exist in memory during active execution.
-	if h.cfg.Action.SFTP.EncryptedPassword != "" {
-		resolver := newKeyResolver()
-		masterKey, err := resolver.ResolveMasterKey(ctx, &h.cfg.Action.SFTP)
-		if err != nil {
-			return nil, fmt.Errorf("security failure (master key resolution): %w", err)
-		}
-
-		realPass, err := libsecsecrets.Decrypt(ctx, h.cfg.Action.SFTP.EncryptedPassword, masterKey)
-		libsecsecrets.ZeroBuffer(masterKey)
-		if err != nil {
-			return nil, fmt.Errorf("security failure (decryption): %w", err)
-		}
-
-		h.cfg.Action.SFTP.Password = realPass
-	}
-
 	h.mu.Lock()
 	if h.consecutiveFail >= circuitBreakerThreshold {
 		h.mu.Unlock()
@@ -223,7 +205,7 @@ func (h *SFTPHandler) Execute(ctx context.Context, files []string) ([]string, er
 	}
 	h.mu.Unlock()
 
-	client, err := h.getOrCreateClient()
+	client, err := h.getOrCreateClient(ctx)
 	if err != nil {
 		h.incrementFail()
 		return nil, err
@@ -327,7 +309,7 @@ func (h *SFTPHandler) resetFail() {
 	h.consecutiveFail = 0
 }
 
-func (h *SFTPHandler) getOrCreateClient() (SFTPClient, error) {
+func (h *SFTPHandler) getOrCreateClient(ctx context.Context) (SFTPClient, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
@@ -343,6 +325,26 @@ func (h *SFTPHandler) getOrCreateClient() (SFTPClient, error) {
 			// Log error but continue to attempt reconnect
 			log.Printf("Error closing lost SFTP connection: %v\n", err)
 		}
+	}
+
+	// 0. Security: Handle Secret Decryption (SFTP Password) before connecting.
+	// This ensures decrypted credentials exist in memory only during active session management.
+	if h.cfg.Action.SFTP.EncryptedPassword != "" && h.cfg.Action.SFTP.Password == "" {
+		resolver := newKeyResolver()
+		masterKey, err := resolver.ResolveMasterKey(ctx, &h.cfg.Action.SFTP)
+		if err != nil {
+			return nil, fmt.Errorf("security failure (master key resolution): %w", err)
+		}
+
+		realPass, err := libsecsecrets.Decrypt(ctx, h.cfg.Action.SFTP.EncryptedPassword, masterKey)
+		libsecsecrets.ZeroBuffer(masterKey)
+		if err != nil {
+			log.Printf("[Action:SFTP] security failure: failed to decrypt password: %v\n", err)
+			return nil, fmt.Errorf("security failure (decryption): %w", err)
+		}
+
+		log.Printf("[Action:SFTP] security: password decrypted successfully\n")
+		h.cfg.Action.SFTP.Password = realPass
 	}
 
 	client, conn, err := h.connect()
@@ -379,7 +381,25 @@ func (h *SFTPHandler) connect() (SFTPClient, SSHClient, error) {
 
 	// Support Password (either as primary auth or as MFA alongside Key)
 	if h.cfg.Action.SFTP.Password != "" {
-		authMethods = append(authMethods, ssh.Password(h.cfg.Action.SFTP.Password))
+		pass := h.cfg.Action.SFTP.Password
+		authMethods = append(authMethods, ssh.Password(pass))
+
+		// Add Keyboard-Interactive authentication
+		// Modern SFTP servers often require this for password prompts.
+		// The error "ssh: unable to authenticate, attempted methods [none], no supported methods remain"
+		// is frequently resolved by providing this method.
+		authMethods = append(authMethods, ssh.KeyboardInteractive(
+			func(user, instruction string, questions []string, echos []bool) ([]string, error) {
+				answers := make([]string, len(questions))
+				for i := range questions {
+					// Most prompts for passwords contain "password" (case-insensitive)
+					if strings.Contains(strings.ToLower(questions[i]), "password") {
+						answers[i] = pass
+					}
+				}
+				return answers, nil
+			},
+		))
 	}
 
 	var hostKeyCallback ssh.HostKeyCallback
@@ -401,7 +421,7 @@ func (h *SFTPHandler) connect() (SFTPClient, SSHClient, error) {
 			return nil, nil, fmt.Errorf("failed to parse host key: %w", err)
 		}
 		hostKeyCallback = ssh.FixedHostKey(pubKey)
-		// Restrict HostKeyAlgorithms to only the provided algorithm
+		// Restrict HostKeyAlgorithms to only the provided algorithm to avoid mismatch if server has multiple keys.
 		sshConfig = &ssh.ClientConfig{
 			User:              h.cfg.Action.SFTP.Username,
 			Auth:              authMethods,
@@ -513,7 +533,15 @@ func (h *SFTPHandler) uploadFile(client SFTPClient, localPath string) error {
 // - Identifies files with the .tmp suffix.
 // - Only deletes files older than 24 hours to avoid interfering with active uploads.
 func (h *SFTPHandler) RemoteCleanup(ctx context.Context) error {
-	client, err := h.getOrCreateClient()
+	// Security: Ensure decrypted password is wiped at end of execution regardless of outcome.
+	defer func() {
+		if h.cfg.Action.SFTP.Password != "" {
+			libsecsecrets.ZeroBuffer([]byte(h.cfg.Action.SFTP.Password))
+			h.cfg.Action.SFTP.Password = ""
+		}
+	}()
+
+	client, err := h.getOrCreateClient(ctx)
 	if err != nil {
 		return err
 	}
